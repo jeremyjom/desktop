@@ -1,18 +1,25 @@
 import * as React from 'react'
 import { PathLabel } from '../lib/path-label'
-import { AppFileStatus, AppFileStatusKind } from '../../models/status'
+import { AppFileStatus } from '../../models/status'
 import { IDiff, DiffType } from '../../models/diff'
 import { Octicon, OcticonSymbol, iconForStatus } from '../octicons'
-import { Button } from '../lib/button'
-import { enableMergeTool } from '../../lib/feature-flag'
 import { mapStatus } from '../../lib/status'
+import { enableSideBySideDiffs } from '../../lib/feature-flag'
+import { DiffOptions } from '../diff/diff-options'
 
 interface IChangedFileDetailsProps {
   readonly path: string
   readonly status: AppFileStatus
-  readonly diff: IDiff
+  readonly diff: IDiff | null
 
-  readonly onOpenMergeTool: (path: string) => void
+  /** Whether we should display side by side diffs. */
+  readonly showSideBySideDiff: boolean
+
+  /** Called when the user changes the side by side diffs setting. */
+  readonly onShowSideBySideDiffChanged: (checked: boolean) => void
+
+  /** Called when the user opens the diff options popover */
+  readonly onDiffOptionsOpened: () => void
 }
 
 /** Displays information about a file */
@@ -29,6 +36,14 @@ export class ChangedFileDetails extends React.Component<
         <PathLabel path={this.props.path} status={this.props.status} />
         {this.renderDecorator()}
 
+        {enableSideBySideDiffs() && (
+          <DiffOptions
+            onShowSideBySideDiffChanged={this.props.onShowSideBySideDiffChanged}
+            showSideBySideDiff={this.props.showSideBySideDiff}
+            onDiffOptionsOpened={this.props.onDiffOptionsOpened}
+          />
+        )}
+
         <Octicon
           symbol={iconForStatus(status)}
           className={'status status-' + fileStatus.toLowerCase()}
@@ -39,18 +54,14 @@ export class ChangedFileDetails extends React.Component<
   }
 
   private renderDecorator() {
-    const status = this.props.status
     const diff = this.props.diff
-    if (status.kind === AppFileStatusKind.Conflicted && enableMergeTool()) {
-      return (
-        <Button className="open-merge-tool" onClick={this.onOpenMergeTool}>
-          {__DARWIN__ ? 'Open Merge Tool' : 'Open merge tool'}
-        </Button>
-      )
-    } else if (diff.kind === DiffType.Text && diff.lineEndingsChange) {
-      const message = `Warning: line endings have changed from '${
-        diff.lineEndingsChange.from
-      }' to '${diff.lineEndingsChange.to}'.`
+
+    if (diff === null) {
+      return null
+    }
+
+    if (diff.kind === DiffType.Text && diff.lineEndingsChange) {
+      const message = `Warning: line endings will be changed from '${diff.lineEndingsChange.from}' to '${diff.lineEndingsChange.to}'.`
       return (
         <Octicon
           symbol={OcticonSymbol.alert}
@@ -61,9 +72,5 @@ export class ChangedFileDetails extends React.Component<
     } else {
       return null
     }
-  }
-
-  private onOpenMergeTool = () => {
-    this.props.onOpenMergeTool(this.props.path)
   }
 }

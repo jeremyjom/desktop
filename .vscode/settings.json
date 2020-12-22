@@ -1,10 +1,12 @@
 {
   "typescript.tsdk": "./node_modules/typescript/lib",
   "search.exclude": {
-    "**/node_modules": true,
+    ".awcache": true,
     "**/dist": true,
+    "**/node_modules": true,
     "**/out": true,
-    ".awcache": true
+    "app/test/fixtures": true,
+    "vendor": true
   },
   "files.exclude": {
     "**/.git": true,
@@ -18,6 +20,7 @@
     ".awcache": true,
     ".eslintcache": true
   },
+  "files.insertFinalNewline": true,
   "editor.tabSize": 2,
   "prettier.semi": false,
   "prettier.singleQuote": true,

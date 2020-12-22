@@ -3,14 +3,14 @@ import { Account } from '../../models/account'
 import { FilterList, IFilterListGroup } from '../lib/filter-list'
 import { IAPIRepository, getDotComAPIEndpoint, getHTMLURL } from '../../lib/api'
 import {
-  IClonableRepositoryListItem,
+  ICloneableRepositoryListItem,
   groupRepositories,
   YourRepositoriesIdentifier,
 } from './group-repositories'
 import memoizeOne from 'memoize-one'
 import { Button } from '../lib/button'
 import { IMatches } from '../../lib/fuzzy-find'
-import { Octicon, OcticonSymbol } from '../octicons'
+import { Octicon, syncClockwise } from '../octicons'
 import { HighlightText } from '../lib/highlight-text'
 import { ClickSource } from '../lib/list'
 import { LinkButton } from '../lib/link-button'
@@ -83,7 +83,7 @@ const RowHeight = 31
  * the clone url of the provided repository.
  */
 function findMatchingListItem(
-  groups: ReadonlyArray<IFilterListGroup<IClonableRepositoryListItem>>,
+  groups: ReadonlyArray<IFilterListGroup<ICloneableRepositoryListItem>>,
   selectedRepository: IAPIRepository | null
 ) {
   if (selectedRepository !== null) {
@@ -106,7 +106,7 @@ function findMatchingListItem(
  */
 function findRepositoryForListItem(
   repositories: ReadonlyArray<IAPIRepository>,
-  listItem: IClonableRepositoryListItem
+  listItem: ICloneableRepositoryListItem
 ) {
   return repositories.find(r => r.clone_url === listItem.url) || null
 }
@@ -162,7 +162,7 @@ export class CloneableRepositoryFilterList extends React.PureComponent<
     const selectedListItem = this.getSelectedListItem(groups, selectedItem)
 
     return (
-      <FilterList<IClonableRepositoryListItem>
+      <FilterList<ICloneableRepositoryListItem>
         className="clone-github-repo"
         rowHeight={RowHeight}
         selectedItem={selectedListItem}
@@ -176,12 +176,13 @@ export class CloneableRepositoryFilterList extends React.PureComponent<
         renderNoItems={this.renderNoItems}
         renderPostFilter={this.renderPostFilter}
         onItemClick={this.props.onItemClicked ? this.onItemClick : undefined}
+        placeholderText="Filter your repositories"
       />
     )
   }
 
   private onItemClick = (
-    item: IClonableRepositoryListItem,
+    item: ICloneableRepositoryListItem,
     source: ClickSource
   ) => {
     const { onItemClicked, repositories } = this.props
@@ -197,7 +198,7 @@ export class CloneableRepositoryFilterList extends React.PureComponent<
     }
   }
 
-  private onSelectionChanged = (item: IClonableRepositoryListItem | null) => {
+  private onSelectionChanged = (item: ICloneableRepositoryListItem | null) => {
     if (item === null || this.props.repositories === null) {
       this.props.onSelectionChanged(null)
     } else {
@@ -220,7 +221,7 @@ export class CloneableRepositoryFilterList extends React.PureComponent<
   }
 
   private renderItem = (
-    item: IClonableRepositoryListItem,
+    item: ICloneableRepositoryListItem,
     matches: IMatches
   ) => {
     return (
@@ -241,7 +242,7 @@ export class CloneableRepositoryFilterList extends React.PureComponent<
         tooltip="Refresh the list of repositories"
       >
         <Octicon
-          symbol={OcticonSymbol.sync}
+          symbol={syncClockwise}
           className={this.props.loading ? 'spin' : undefined}
         />
       </Button>
@@ -250,9 +251,15 @@ export class CloneableRepositoryFilterList extends React.PureComponent<
 
   private renderNoItems = () => {
     const { loading, repositories } = this.props
+    const endpointName =
+      this.props.account.endpoint === getDotComAPIEndpoint()
+        ? 'GitHub.com'
+        : getHTMLURL(this.props.account.endpoint)
 
     if (loading && (repositories === null || repositories.length === 0)) {
-      return <div className="no-items loading">Loading repositories…</div>
+      return (
+        <div className="no-items loading">{`Loading repositories from ${endpointName}…`}</div>
+      )
     }
 
     if (this.props.filterText.length !== 0) {
@@ -266,18 +273,13 @@ export class CloneableRepositoryFilterList extends React.PureComponent<
       )
     }
 
-    const endpointName =
-      this.props.account.endpoint === getDotComAPIEndpoint()
-        ? 'GitHub.com'
-        : getHTMLURL(this.props.account.endpoint)
-
     return (
       <div className="no-items empty-repository-list">
         <div>
-          Couldn't find any repositories for the account{' '}
+          Looks like there are no repositories for{' '}
           <Ref>{this.props.account.login}</Ref> on {endpointName}.{' '}
           <LinkButton onClick={this.refreshRepositories}>
-            Refresh the list
+            Refresh this list
           </LinkButton>{' '}
           if you've created a repository recently.
         </div>

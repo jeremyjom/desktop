@@ -1,14 +1,15 @@
 import Dexie from 'dexie'
 import { BaseDatabase } from './base-database'
+import { WorkflowPreferences } from '../../models/workflow-preferences'
 
 export interface IDatabaseOwner {
-  readonly id?: number | null
+  readonly id?: number
   readonly login: string
   readonly endpoint: string
 }
 
 export interface IDatabaseGitHubRepository {
-  readonly id?: number | null
+  readonly id?: number
   readonly ownerID: number
   readonly name: string
   readonly private: boolean | null
@@ -21,6 +22,11 @@ export interface IDatabaseGitHubRepository {
 
   /** The last time a prune was attempted on the repository */
   readonly lastPruneDate: number | null
+
+  readonly issuesEnabled?: boolean
+  readonly isArchived?: boolean
+
+  readonly permissions?: 'read' | 'write' | 'admin' | null
 }
 
 /** A record to track the protected branch information for a GitHub repository */
@@ -29,19 +35,29 @@ export interface IDatabaseProtectedBranch {
   /**
    * The branch name associated with the branch protection settings
    *
-   * NOTE: this is NOT a fully-qualified ref (i.e. `refs/heads/master`)
+   * NOTE: this is NOT a fully-qualified ref (i.e. `refs/heads/main`)
    */
   readonly name: string
 }
 
 export interface IDatabaseRepository {
-  readonly id?: number | null
+  readonly id?: number
   readonly gitHubRepositoryID: number | null
   readonly path: string
   readonly missing: boolean
 
   /** The last time the stash entries were checked for the repository */
-  readonly lastStashCheckDate: number | null
+  readonly lastStashCheckDate?: number | null
+
+  readonly workflowPreferences?: WorkflowPreferences
+
+  /**
+   * True if the repository is a tutorial repository created as part
+   * of the onboarding flow. Tutorial repositories trigger a tutorial
+   * user experience which introduces new users to some core concepts
+   * of Git and GitHub.
+   */
+  readonly isTutorialRepository?: boolean
 }
 
 /**
@@ -101,6 +117,12 @@ export class RepositoriesDatabase extends BaseDatabase {
     this.conditionalVersion(6, {
       protectedBranches: '[repoId+name], repoId',
     })
+
+    this.conditionalVersion(7, {
+      gitHubRepositories: '++id, &[ownerID+name]',
+    })
+
+    this.conditionalVersion(8, {}, ensureNoUndefinedParentID)
   }
 }
 
@@ -125,4 +147,13 @@ function removeDuplicateGitHubRepositories(transaction: Dexie.Transaction) {
       seenKeys.add(key)
     }
   })
+}
+
+async function ensureNoUndefinedParentID(tx: Dexie.Transaction) {
+  return tx
+    .table<IDatabaseGitHubRepository, number>('gitHubRepositories')
+    .toCollection()
+    .filter(ghRepo => ghRepo.parentID === undefined)
+    .modify({ parentID: null })
+    .then(modified => log.info(`ensureNoUndefinedParentID: ${modified}`))
 }

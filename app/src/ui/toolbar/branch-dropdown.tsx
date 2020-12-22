@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { Dispatcher } from '../dispatcher'
-import { OcticonSymbol } from '../octicons'
+import { OcticonSymbol, syncClockwise } from '../octicons'
 import { Repository } from '../../models/repository'
 import { TipState } from '../../models/tip'
 import { ToolbarDropdown, DropdownState } from './dropdown'
@@ -9,6 +9,7 @@ import { BranchesContainer, PullRequestBadge } from '../branches'
 import { assertNever } from '../../lib/fatal-error'
 import { BranchesTab } from '../../models/branches-tab'
 import { PullRequest } from '../../models/pull-request'
+import classNames from 'classnames'
 
 interface IBranchDropdownProps {
   readonly dispatcher: Dispatcher
@@ -42,8 +43,8 @@ interface IBranchDropdownProps {
   /** Are we currently loading pull requests? */
   readonly isLoadingPullRequests: boolean
 
-  /** Was this component launched from the "Protected Branch" warning message? */
-  readonly handleProtectedBranchWarning?: boolean
+  /** Whether this component should show its onboarding tutorial nudge arrow */
+  readonly shouldNudge: boolean
 }
 
 /**
@@ -69,7 +70,6 @@ export class BranchDropdown extends React.Component<IBranchDropdownProps> {
         pullRequests={this.props.pullRequests}
         currentPullRequest={this.props.currentPullRequest}
         isLoadingPullRequests={this.props.isLoadingPullRequests}
-        handleProtectedBranchWarning={this.props.handleProtectedBranchWarning}
       />
     )
   }
@@ -130,11 +130,11 @@ export class BranchDropdown extends React.Component<IBranchDropdownProps> {
 
       if (checkoutProgress.value > 0) {
         const friendlyProgress = Math.round(checkoutProgress.value * 100)
-        description = `${description} (${friendlyProgress} %)`
+        description = `${description} (${friendlyProgress}%)`
       }
 
       progressValue = checkoutProgress.value
-      icon = OcticonSymbol.sync
+      icon = syncClockwise
       iconClassName = 'spin'
       canOpen = false
     } else if (conflictState !== null && isRebaseConflictState(conflictState)) {
@@ -147,6 +147,9 @@ export class BranchDropdown extends React.Component<IBranchDropdownProps> {
 
     const isOpen = this.props.isOpen
     const currentState: DropdownState = isOpen && canOpen ? 'open' : 'closed'
+    const buttonClassName = classNames('nudge-arrow', {
+      'nudge-arrow-up': this.props.shouldNudge,
+    })
 
     return (
       <ToolbarDropdown
@@ -162,6 +165,7 @@ export class BranchDropdown extends React.Component<IBranchDropdownProps> {
         disabled={disabled}
         showDisclosureArrow={canOpen}
         progressValue={progressValue}
+        buttonClassName={buttonClassName}
       >
         {this.renderPullRequestInfo()}
       </ToolbarDropdown>
@@ -170,9 +174,8 @@ export class BranchDropdown extends React.Component<IBranchDropdownProps> {
 
   private renderPullRequestInfo() {
     const pr = this.props.currentPullRequest
-    const repository = this.props.repository.gitHubRepository
 
-    if (pr === null || repository === null) {
+    if (pr === null) {
       return null
     }
 
@@ -180,7 +183,7 @@ export class BranchDropdown extends React.Component<IBranchDropdownProps> {
       <PullRequestBadge
         number={pr.pullRequestNumber}
         dispatcher={this.props.dispatcher}
-        repository={repository}
+        repository={pr.base.gitHubRepository}
       />
     )
   }

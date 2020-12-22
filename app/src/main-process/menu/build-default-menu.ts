@@ -4,16 +4,11 @@ import { MenuEvent } from './menu-event'
 import { truncateWithEllipsis } from '../../lib/truncate-with-ellipsis'
 import { getLogDirectoryPath } from '../../lib/logging/get-log-path'
 import { ensureDir } from 'fs-extra'
-
-import { log } from '../log'
-import { openDirectorySafe } from '../shell'
-import { enableRebaseDialog, enableStashing } from '../../lib/feature-flag'
+import { UNSAFE_openDirectory } from '../shell'
+import { enableCreateGitHubIssueFromMenu } from '../../lib/feature-flag'
 import { MenuLabelsEvent } from '../../models/menu-labels'
-import { DefaultEditorLabel } from '../../ui/lib/context-menu'
 
-const defaultShellLabel = __DARWIN__
-  ? 'Open in Terminal'
-  : 'Open in Command Prompt'
+const platformDefaultShell = __WIN32__ ? 'Command Prompt' : 'Terminal'
 const createPullRequestLabel = __DARWIN__
   ? 'Create Pull Request'
   : 'Create &pull request'
@@ -23,6 +18,12 @@ const showPullRequestLabel = __DARWIN__
 const defaultBranchNameValue = __DARWIN__ ? 'Default Branch' : 'default branch'
 const confirmRepositoryRemovalLabel = __DARWIN__ ? 'Remove…' : '&Remove…'
 const repositoryRemovalLabel = __DARWIN__ ? 'Remove' : '&Remove'
+const confirmStashAllChangesLabel = __DARWIN__
+  ? 'Stash All Changes…'
+  : '&Stash all changes…'
+const stashAllChangesLabel = __DARWIN__
+  ? 'Stash All Changes'
+  : '&Stash all changes'
 
 enum ZoomDirection {
   Reset,
@@ -39,6 +40,7 @@ export function buildDefaultMenu({
   defaultBranchName = defaultBranchNameValue,
   isForcePushForCurrentRepository = false,
   isStashedChangesVisible = false,
+  askForConfirmationWhenStashingAllChanges = true,
 }: MenuLabelsEvent): Electron.Menu {
   defaultBranchName = truncateWithEllipsis(defaultBranchName, 25)
 
@@ -49,14 +51,6 @@ export function buildDefaultMenu({
   const pullRequestLabel = hasCurrentPullRequest
     ? showPullRequestLabel
     : createPullRequestLabel
-
-  const shellLabel =
-    selectedShell === null ? defaultShellLabel : `Open in ${selectedShell}`
-
-  const editorLabel =
-    selectedExternalEditor === null
-      ? DefaultEditorLabel
-      : `Open in ${selectedExternalEditor}`
 
   const template = new Array<Electron.MenuItemConstructorOptions>()
   const separator: Electron.MenuItemConstructorOptions = { type: 'separator' }
@@ -90,7 +84,7 @@ export function buildDefaultMenu({
         },
         separator,
         { role: 'hide' },
-        { role: 'hideothers' },
+        { role: 'hideOthers' },
         { role: 'unhide' },
         separator,
         { role: 'quit' },
@@ -210,7 +204,6 @@ export function buildDefaultMenu({
         click: isStashedChangesVisible
           ? emit('hide-stashed-changes')
           : emit('show-stashed-changes'),
-        visible: enableStashing(),
       },
       {
         label: __DARWIN__ ? 'Toggle Full Screen' : 'Toggle &full screen',
@@ -241,7 +234,7 @@ export function buildDefaultMenu({
         // chorded shortcuts, but this menu item is not a user-facing feature
         // so we are going to keep this one around.
         accelerator: 'CmdOrCtrl+Alt+R',
-        click(item: any, focusedWindow: Electron.BrowserWindow) {
+        click(item: any, focusedWindow: Electron.BrowserWindow | undefined) {
           if (focusedWindow) {
             focusedWindow.reload()
           }
@@ -256,7 +249,7 @@ export function buildDefaultMenu({
         accelerator: (() => {
           return __DARWIN__ ? 'Alt+Command+I' : 'Ctrl+Shift+I'
         })(),
-        click(item: any, focusedWindow: Electron.BrowserWindow) {
+        click(item: any, focusedWindow: Electron.BrowserWindow | undefined) {
           if (focusedWindow) {
             focusedWindow.webContents.toggleDevTools()
           }
@@ -302,7 +295,9 @@ export function buildDefaultMenu({
         click: emit('view-repository-on-github'),
       },
       {
-        label: shellLabel,
+        label: __DARWIN__
+          ? `Open in ${selectedShell ?? platformDefaultShell}`
+          : `O&pen in ${selectedShell ?? platformDefaultShell}`,
         id: 'open-in-shell',
         accelerator: 'Ctrl+`',
         click: emit('open-in-shell'),
@@ -318,10 +313,22 @@ export function buildDefaultMenu({
         click: emit('open-working-directory'),
       },
       {
-        label: editorLabel,
+        label: __DARWIN__
+          ? `Open in ${selectedExternalEditor ?? 'External Editor'}`
+          : `&Open in ${selectedExternalEditor ?? 'external editor'}`,
         id: 'open-external-editor',
         accelerator: 'CmdOrCtrl+Shift+A',
         click: emit('open-external-editor'),
+      },
+      separator,
+      {
+        id: 'create-issue-in-repository-on-github',
+        label: __DARWIN__
+          ? 'Create Issue on GitHub'
+          : 'Create &issue on GitHub',
+        accelerator: 'CmdOrCtrl+I',
+        click: emit('create-issue-in-repository-on-github'),
+        visible: enableCreateGitHubIssueFromMenu(),
       },
       separator,
       {
@@ -361,6 +368,14 @@ export function buildDefaultMenu({
         accelerator: 'CmdOrCtrl+Shift+Backspace',
         click: emit('discard-all-changes'),
       },
+      {
+        label: askForConfirmationWhenStashingAllChanges
+          ? confirmStashAllChangesLabel
+          : stashAllChangesLabel,
+        id: 'stash-all-changes',
+        accelerator: 'CmdOrCtrl+Shift+S',
+        click: emit('stash-all-changes'),
+      },
       separator,
       {
         label: __DARWIN__
@@ -391,7 +406,6 @@ export function buildDefaultMenu({
         id: 'rebase-branch',
         accelerator: 'CmdOrCtrl+Shift+E',
         click: emit('rebase-branch'),
-        visible: enableRebaseDialog(),
       },
       separator,
       {
@@ -425,32 +439,40 @@ export function buildDefaultMenu({
   const submitIssueItem: Electron.MenuItemConstructorOptions = {
     label: __DARWIN__ ? 'Report Issue…' : 'Report issue…',
     click() {
-      shell.openExternal('https://github.com/desktop/desktop/issues/new/choose')
+      shell
+        .openExternal('https://github.com/desktop/desktop/issues/new/choose')
+        .catch(err => log.error('Failed opening issue creation page', err))
     },
   }
 
   const contactSupportItem: Electron.MenuItemConstructorOptions = {
     label: __DARWIN__ ? 'Contact GitHub Support…' : '&Contact GitHub support…',
     click() {
-      shell.openExternal(
-        `https://github.com/contact?from_desktop_app=1&app_version=${app.getVersion()}`
-      )
+      shell
+        .openExternal(
+          `https://github.com/contact?from_desktop_app=1&app_version=${app.getVersion()}`
+        )
+        .catch(err => log.error('Failed opening contact support page', err))
     },
   }
 
   const showUserGuides: Electron.MenuItemConstructorOptions = {
     label: 'Show User Guides',
     click() {
-      shell.openExternal('https://help.github.com/desktop/guides/')
+      shell
+        .openExternal('https://help.github.com/desktop/guides/')
+        .catch(err => log.error('Failed opening user guides page', err))
     },
   }
 
   const showKeyboardShortcuts: Electron.MenuItemConstructorOptions = {
     label: __DARWIN__ ? 'Show Keyboard Shortcuts' : 'Show keyboard shortcuts',
     click() {
-      shell.openExternal(
-        'https://help.github.com/en/desktop/getting-started-with-github-desktop/keyboard-shortcuts-in-github-desktop'
-      )
+      shell
+        .openExternal(
+          'https://help.github.com/en/desktop/getting-started-with-github-desktop/keyboard-shortcuts-in-github-desktop'
+        )
+        .catch(err => log.error('Failed opening keyboard shortcuts page', err))
     },
   }
 
@@ -466,10 +488,10 @@ export function buildDefaultMenu({
       const logPath = getLogDirectoryPath()
       ensureDir(logPath)
         .then(() => {
-          openDirectorySafe(logPath)
+          UNSAFE_openDirectory(logPath)
         })
         .catch(err => {
-          log('error', err.message)
+          log.error('Failed opening logs directory', err)
         })
     },
   }
@@ -561,7 +583,7 @@ function getStashedChangesLabel(isStashedChangesVisible: boolean): string {
 
 type ClickHandler = (
   menuItem: Electron.MenuItem,
-  browserWindow: Electron.BrowserWindow,
+  browserWindow: Electron.BrowserWindow | undefined,
   event: Electron.Event
 ) => void
 
@@ -608,15 +630,15 @@ function zoom(direction: ZoomDirection): ClickHandler {
     const { webContents } = window
 
     if (direction === ZoomDirection.Reset) {
-      webContents.setZoomFactor(1)
+      webContents.zoomFactor = 1
       webContents.send('zoom-factor-changed', 1)
     } else {
-      const rawZoom = webContents.getZoomFactor()
+      const rawZoom = webContents.zoomFactor
       const zoomFactors =
         direction === ZoomDirection.In ? ZoomInFactors : ZoomOutFactors
 
-      // So the values that we get from getZoomFactor are floating point
-      // precision numbers from chromium that don't always round nicely so
+      // So the values that we get from zoomFactor property are floating point
+      // precision numbers from chromium, that don't always round nicely, so
       // we'll have to do a little trick to figure out which of our supported
       // zoom factors the value is referring to.
       const currentZoom = findClosestValue(zoomFactors, rawZoom)
@@ -630,7 +652,7 @@ function zoom(direction: ZoomDirection): ClickHandler {
       // factor we've got.
       const newZoom = nextZoomLevel === undefined ? currentZoom : nextZoomLevel
 
-      webContents.setZoomFactor(newZoom)
+      webContents.zoomFactor = newZoom
       webContents.send('zoom-factor-changed', newZoom)
     }
   }

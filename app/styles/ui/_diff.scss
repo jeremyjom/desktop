@@ -27,7 +27,8 @@
     padding: 0;
   }
 
-  &-line {
+  pre.CodeMirror-line,
+  pre.CodeMirror-line-like {
     padding: 2px 0 2px var(--spacing-half);
 
     svg.no-newline {
@@ -71,6 +72,7 @@
     padding: var(--spacing-half) var(--spacing);
     box-shadow: var(--base-box-shadow);
 
+    .CodeMirror-search-label,
     .CodeMirror-search-hint {
       display: none;
     }
@@ -324,17 +326,20 @@
 .panel.image {
   display: flex;
   flex: 1;
-  padding-top: 10px;
-  // Workaround so images stay within diff view until
-  // root issue with DPI scaling is addressed, see https://github.com/desktop/desktop/issues/2480
-  overflow: hidden;
+  padding: var(--spacing);
+  min-width: 0;
+  min-height: 0;
 
   .tab-bar {
     width: 350px;
-    margin: 10px auto 0;
-    // Workaround to allow toggling between different modes until
-    // root issue with DPI scaling is addressed, see https://github.com/desktop/desktop/issues/2480
-    z-index: 0;
+    margin: var(--spacing) auto 0;
+  }
+
+  // https://stackoverflow.com/a/30792956/2114
+  .image-wrapper {
+    min-width: 0;
+    min-height: 0;
+    text-align: center;
   }
 
   .image-diff-previous {
@@ -346,7 +351,12 @@
 
   .image-diff-previous,
   .image-diff-current {
-    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 0;
+    min-width: 0;
 
     img {
       @include checkboard-background;
@@ -369,14 +379,20 @@
 
 .image-diff-container {
   display: flex;
-  flex: 1;
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
   justify-content: center;
   align-items: center;
-  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
 
   .image-diff-two-up {
     display: flex;
-    align-items: center;
+    max-height: 100%;
+    min-height: 0;
+    min-width: 0;
+    padding: 0 var(--spacing-double);
 
     .image-diff-previous {
       margin-right: var(--spacing-half);
@@ -404,12 +420,16 @@
   display: flex;
   flex-direction: column;
   flex: 1;
+  min-height: 0;
+  min-width: 0;
 
   .sizing-container {
     flex: 1;
     display: flex;
     justify-content: center;
     align-items: center;
+    min-height: 0;
+    min-width: 0;
 
     .image-container {
       position: relative;
@@ -417,9 +437,10 @@
       .image-diff-previous,
       .image-diff-current {
         position: absolute;
-        top: 0;
-        left: 0;
-        img : {
+        height: 100%;
+        width: 100%;
+
+        img {
           border: 0;
           background: transparent;
         }
@@ -432,6 +453,8 @@
   display: flex;
   flex-direction: column;
   flex: 1;
+  min-height: 0;
+  min-width: 0;
 
   .slider {
     align-self: center;
@@ -444,24 +467,18 @@
     display: flex;
     justify-content: center;
     align-items: center;
+    min-height: 0;
+    min-width: 0;
 
     .image-diff-previous,
     .image-diff-current {
       position: absolute;
-      margin: 0;
-      overflow: hidden;
+      width: 100%;
+      height: 100%;
 
       img {
-        border: 0;
         background: transparent;
       }
-    }
-
-    .image-diff-previous {
-      border: 1px solid var(--color-deleted);
-    }
-    .image-diff-current {
-      border: 1px solid var(--color-new);
     }
 
     .image-container {
@@ -475,6 +492,8 @@
   display: flex;
   flex-direction: column;
   flex: 1;
+  min-height: 0;
+  min-width: 0;
 
   .slider {
     align-self: center;
@@ -487,33 +506,23 @@
     display: flex;
     justify-content: center;
     align-items: center;
+    min-height: 0;
+    min-width: 0;
 
     .image-container {
       position: relative;
+      @include checkboard-background;
 
       .image-diff-previous,
       .image-diff-current {
-        @include checkboard-background;
         position: absolute;
-        margin: 0;
-        overflow: hidden;
 
         img {
-          border: 0;
           background: transparent;
         }
       }
 
-      .image-diff-previous {
-        border: 1px solid var(--color-deleted);
-        right: 0;
-      }
-      .image-diff-current {
-        border: 1px solid var(--color-new);
-      }
-
       .swiper {
-        border-left: 1px solid var(--text-secondary-color);
         margin: 0;
         overflow: hidden;
         position: absolute;
@@ -590,15 +599,6 @@
     color: var(--syntax-header-color);
   }
 
-  // Intra line markings takes precedence over syntax highlighting.
-  .cm-diff-delete-inner {
-    color: var(--diff-delete-text-color);
-  }
-
-  .cm-diff-add-inner {
-    color: var(--diff-add-text-color);
-  }
-
   .cm-m-css {
     &.cm-property {
       color: var(--syntax-atom-color);
@@ -614,6 +614,70 @@
   .cm-m-javascript {
     &.cm-type {
       color: var(--syntax-variable-color);
+    }
+  }
+
+  // Intra line markings takes precedence over syntax highlighting.
+  .cm-diff-delete-inner {
+    color: var(--diff-delete-text-color) !important;
+  }
+
+  .cm-diff-add-inner {
+    color: var(--diff-add-text-color) !important;
+  }
+}
+
+.seamless-diff-switcher {
+  display: flex;
+  flex-grow: 1;
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
+
+  .loading-indicator {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    display: none;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  // When loading a diff
+  &.loading {
+    // Get ready to fade out the diff if it takes too long to load it
+    & > * {
+      transition: opacity 100ms ease-in;
+    }
+
+    .loading-indicator {
+      display: block;
+    }
+
+    // When there's no previous diff (i.e. first time the component mounts)
+    // we'll show the loading indicator immediately
+    &:not(.has-diff) {
+      .loading-indicator {
+        display: block;
+        opacity: 1;
+      }
+    }
+
+    // When there is a previous diff available we'll wait for a little bit
+    // (defined in the component tsx) until we risk the user becoming aware
+    // of our little trick and noticing that the diff hasn't changed. When
+    // we hit that threshold we...
+    &.has-diff.slow {
+      // ...fade in the loading indicator...
+      & > .loading-indicator {
+        display: block;
+        opacity: 1;
+      }
+
+      // ...and fade everything else out
+      & > :not(.loading-indicator) {
+        opacity: 0.2;
+      }
     }
   }
 }

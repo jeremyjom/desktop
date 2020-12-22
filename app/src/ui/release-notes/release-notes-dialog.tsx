@@ -5,8 +5,6 @@ import { encodePathAsUrl } from '../../lib/path'
 import { ReleaseNote, ReleaseSummary } from '../../models/release-notes'
 
 import { updateStore } from '../lib/update-store'
-import { ButtonGroup } from '../lib/button-group'
-import { Button } from '../lib/button'
 import { LinkButton } from '../lib/link-button'
 
 import { Dialog, DialogContent, DialogFooter } from '../dialog'
@@ -16,34 +14,21 @@ import { Repository } from '../../models/repository'
 import { getDotComAPIEndpoint } from '../../lib/api'
 import { shell } from '../../lib/app-shell'
 import { ReleaseNotesUri } from '../lib/releases'
+import { OkCancelButtonGroup } from '../dialog/ok-cancel-button-group'
+import { GitHubRepository } from '../../models/github-repository'
+import { Owner } from '../../models/owner'
 
 // HACK: This is needed because the `Rich`Text` component
 // needs to know what repo to link issues against.
 // Since release notes are Desktop specific, we can't
-// reley on the repo info we keep in state, so we've
+// rely on the repo info we keep in state, so we've
 // stubbed out this repo
-const repository = new Repository(
+const desktopOwner = new Owner('desktop', getDotComAPIEndpoint(), -1)
+const desktopUrl = 'https://github.com/desktop/desktop'
+const desktopRepository = new Repository(
   '',
   -1,
-  {
-    dbID: null,
-    name: 'desktop',
-    owner: {
-      id: null,
-      login: 'desktop',
-      endpoint: getDotComAPIEndpoint(),
-      hash: '',
-    },
-    private: false,
-    parent: null,
-    htmlURL: 'https://github.com/desktop/desktop',
-    defaultBranch: 'master',
-    cloneURL: 'https://github.com/desktop/desktop',
-    endpoint: getDotComAPIEndpoint(),
-    fullName: 'desktop/desktop',
-    fork: false,
-    hash: '',
-  },
+  new GitHubRepository('desktop', desktopOwner, -1, false, desktopUrl),
   true
 )
 
@@ -83,7 +68,7 @@ export class ReleaseNotes extends React.Component<IReleaseNotesProps, {}> {
             text={entry.message}
             emoji={this.props.emoji}
             renderUrlsAsLinks={true}
-            repository={repository}
+            repository={desktopRepository}
           />
         </li>
       )
@@ -154,6 +139,7 @@ export class ReleaseNotes extends React.Component<IReleaseNotesProps, {}> {
       <Dialog
         id="release-notes"
         onDismissed={this.props.onDismissed}
+        onSubmit={this.updateNow}
         title={dialogHeader}
       >
         <DialogContent>{contents}</DialogContent>
@@ -161,12 +147,13 @@ export class ReleaseNotes extends React.Component<IReleaseNotesProps, {}> {
           <LinkButton onClick={this.showAllReleaseNotes}>
             View all release notes
           </LinkButton>
-          <ButtonGroup destructive={true}>
-            <Button type="submit">Close</Button>
-            <Button onClick={this.updateNow}>
-              {__DARWIN__ ? 'Install and Restart' : 'Install and restart'}
-            </Button>
-          </ButtonGroup>
+          <OkCancelButtonGroup
+            destructive={true}
+            okButtonText={
+              __DARWIN__ ? 'Install and Restart' : 'Install and restart'
+            }
+            cancelButtonText="Close"
+          />
         </DialogFooter>
       </Dialog>
     )

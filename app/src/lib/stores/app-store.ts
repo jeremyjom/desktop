@@ -1,3 +1,4 @@
+import * as Path from 'path'
 import { ipcRenderer, remote } from 'electron'
 import { pathExists } from 'fs-extra'
 import { escape } from 'querystring'
@@ -7,18 +8,14 @@ import {
   GitHubUserStore,
   GitStore,
   IssuesStore,
-  PullRequestStore,
+  PullRequestCoordinator,
   RepositoriesStore,
   SignInStore,
 } from '.'
 import { Account } from '../../models/account'
 import { AppMenu, IMenu } from '../../models/app-menu'
 import { IAuthor } from '../../models/author'
-import {
-  Branch,
-  eligibleForFastForward,
-  IAheadBehind,
-} from '../../models/branch'
+import { Branch, BranchType } from '../../models/branch'
 import { BranchesTab } from '../../models/branches-tab'
 import { CloneRepositoryTab } from '../../models/clone-repository-tab'
 import { CloningRepository } from '../../models/cloning-repository'
@@ -28,10 +25,13 @@ import {
   DiffSelectionType,
   DiffType,
   ImageDiffType,
+  ITextDiff,
 } from '../../models/diff'
 import { FetchType } from '../../models/fetch'
-import { GitHubRepository } from '../../models/github-repository'
-import { Owner } from '../../models/owner'
+import {
+  GitHubRepository,
+  hasWritePermission,
+} from '../../models/github-repository'
 import { PullRequest } from '../../models/pull-request'
 import {
   forkPullRequestRemoteName,
@@ -42,6 +42,9 @@ import {
   ILocalRepositoryState,
   nameOf,
   Repository,
+  isRepositoryWithGitHubRepository,
+  RepositoryWithGitHubRepository,
+  getNonForkGitHubRepository,
 } from '../../models/repository'
 import {
   CommittedFileChange,
@@ -78,7 +81,8 @@ import {
   getAccountForEndpoint,
   getDotComAPIEndpoint,
   IAPIOrganization,
-  IAPIBranch,
+  getEndpointForRepository,
+  IAPIFullRepository,
 } from '../api'
 import { shell } from '../app-shell'
 import {
@@ -103,7 +107,6 @@ import {
   ChangesSelectionKind,
   ChangesWorkingDirectorySelection,
 } from '../app-state'
-import { IGitHubUser } from '../databases/github-user-database'
 import {
   ExternalEditor,
   findEditorOrDefault,
@@ -111,9 +114,8 @@ import {
   launchExternalEditor,
   parse,
 } from '../editors'
-import { assertNever, fatalError, forceUnwrap } from '../fatal-error'
+import { assertNever, fatalError } from '../fatal-error'
 
-import { findAccountForRemoteURL } from '../find-account'
 import { formatCommitMessage } from '../format-commit-message'
 import { getGenericHostname, getGenericUsername } from '../generic-git-auth'
 import { getAccountForRepository } from '../get-account-for-repository'
@@ -121,7 +123,6 @@ import {
   abortMerge,
   addRemote,
   checkoutBranch,
-  createBranch,
   createCommit,
   deleteBranch,
   formatAsLocalRef,
@@ -150,6 +151,8 @@ import {
   RebaseResult,
   getRebaseSnapshot,
   IStatusResult,
+  GitError,
+  MergeResult,
 } from '../git'
 import {
   installGlobalLFSFilters,
@@ -162,7 +165,8 @@ import { merge } from '../merge'
 import {
   IMatchedGitHubRepository,
   matchGitHubRepository,
-  repositoryMatchesRemote,
+  matchExistingRepository,
+  urlMatchesRemote,
 } from '../repository-matching'
 import {
   initializeRebaseFlowForConflictedRepository,
@@ -191,17 +195,23 @@ import {
 } from '../window-state'
 import { TypedBaseStore } from './base-store'
 import { AheadBehindUpdater } from './helpers/ahead-behind-updater'
-import { MergeResult } from '../../models/merge'
-import { promiseWithMinimumTimeout, timeout } from '../promise'
+import { MergeTreeResult } from '../../models/merge'
+import { promiseWithMinimumTimeout, sleep } from '../promise'
 import { BackgroundFetcher } from './helpers/background-fetcher'
-import { inferComparisonBranch } from './helpers/infer-comparison-branch'
-import { PullRequestUpdater } from './helpers/pull-request-updater'
 import { validatedRepositoryPath } from './helpers/validated-repository-path'
 import { RepositoryStateCache } from './repository-state-cache'
 import { readEmoji } from '../read-emoji'
 import { GitStoreCache } from './git-store-cache'
 import { GitErrorContext } from '../git-error-context'
-import { setNumber, setBoolean, getBoolean, getNumber } from '../local-storage'
+import {
+  setNumber,
+  setBoolean,
+  getBoolean,
+  getNumber,
+  getNumberArray,
+  setNumberArray,
+  getEnum,
+} from '../local-storage'
 import { ExternalEditorError } from '../editors/shared'
 import { ApiRepositoriesStore } from './api-repositories-store'
 import {
@@ -209,21 +219,11 @@ import {
   updateConflictState,
   selectWorkingDirectoryFiles,
 } from './updates/changes-state'
-import {
-  ManualConflictResolution,
-  ManualConflictResolutionKind,
-} from '../../models/manual-conflict-resolution'
+import { ManualConflictResolution } from '../../models/manual-conflict-resolution'
 import { BranchPruner } from './helpers/branch-pruner'
-import {
-  enableBranchPruning,
-  enableGroupRepositoriesByOwner,
-  enableStashing,
-  enableBranchProtectionChecks,
-  enableBranchProtectionWarningFlow,
-  enableHideWhitespaceInDiffOption,
-} from '../feature-flag'
+import { enableUpdateRemoteUrl } from '../feature-flag'
 import { Banner, BannerType } from '../../models/banner'
-import * as moment from 'moment'
+import moment from 'moment'
 import { isDarkModeEnabled } from '../../ui/lib/dark-theme'
 import { ComputedAction } from '../../models/computed-action'
 import {
@@ -234,21 +234,43 @@ import {
 } from '../git/stash'
 import {
   UncommittedChangesStrategy,
-  UncommittedChangesStrategyKind,
-  askToStash,
+  defaultUncommittedChangesStrategy,
 } from '../../models/uncommitted-changes-strategy'
 import { IStashEntry, StashedChangesLoadStates } from '../../models/stash-entry'
 import { RebaseFlowStep, RebaseStep } from '../../models/rebase-flow-step'
 import { arrayEquals } from '../equality'
 import { MenuLabelsEvent } from '../../models/menu-labels'
 import { findRemoteBranchName } from './helpers/find-branch-name'
-
-/**
- * As fast-forwarding local branches is proportional to the number of local
- * branches, and is run after every fetch/push/pull, this is skipped when the
- * number of eligible branches is greater than a given threshold.
- */
-const FastForwardBranchesThreshold = 20
+import { updateRemoteUrl } from './updates/update-remote-url'
+import { findBranchesForFastForward } from './helpers/find-branches-for-fast-forward'
+import {
+  TutorialStep,
+  orderedTutorialSteps,
+  isValidTutorialStep,
+} from '../../models/tutorial-step'
+import { OnboardingTutorialAssessor } from './helpers/tutorial-assessor'
+import { getUntrackedFiles } from '../status'
+import { enableProgressBarOnIcon } from '../feature-flag'
+import { isBranchPushable } from '../helpers/push-control'
+import {
+  findAssociatedPullRequest,
+  isPullRequestAssociatedWithBranch,
+} from '../helpers/pull-request-matching'
+import { parseRemote } from '../../lib/remote-parsing'
+import { createTutorialRepository } from './helpers/create-tutorial-repository'
+import { sendNonFatalException } from '../helpers/non-fatal-exception'
+import { getDefaultDir } from '../../ui/lib/default-dir'
+import { WorkflowPreferences } from '../../models/workflow-preferences'
+import { RepositoryIndicatorUpdater } from './helpers/repository-indicator-updater'
+import { getAttributableEmailsFor } from '../email'
+import { TrashNameLabel } from '../../ui/lib/context-menu'
+import { GitError as DugiteError } from 'dugite'
+import { ErrorWithMetadata, CheckoutError } from '../error-with-metadata'
+import {
+  ShowSideBySideDiffDefault,
+  getShowSideBySideDiff,
+  setShowSideBySideDiff,
+} from '../../ui/lib/diff-mode'
 
 const LastSelectedRepositoryIDKey = 'last-selected-repository-id'
 
@@ -258,7 +280,6 @@ const RecentRepositoriesKey = 'recently-selected-repositories'
  *  in the repository switcher dropdown
  */
 const RecentRepositoriesLength = 3
-const RecentRepositoriesDelimiter = ','
 
 const defaultSidebarWidth: number = 250
 const sidebarWidthConfigKey: string = 'sidebar-width'
@@ -276,6 +297,8 @@ const confirmRepoRemovalKey: string = 'confirmRepoRemoval'
 const confirmDiscardChangesKey: string = 'confirmDiscardChanges'
 const confirmForcePushKey: string = 'confirmForcePush'
 
+const uncommittedChangesStrategyKey = 'uncommittedChangesStrategyKind'
+
 const externalEditorKey: string = 'externalEditor'
 
 const imageDiffTypeDefault = ImageDiffType.TwoUp
@@ -286,10 +309,19 @@ const hideWhitespaceInDiffKey = 'hide-whitespace-in-diff'
 
 const shellKey = 'shell'
 
+const repositoryIndicatorsEnabledKey = 'enable-repository-indicators'
+
 // background fetching should occur hourly when Desktop is active, but this
 // lower interval ensures user interactions like switching repositories and
 // switching between apps does not result in excessive fetching in the app
 const BackgroundFetchMinimumInterval = 30 * 60 * 1000
+
+/**
+ * Wait 2 minutes before refreshing repository indicators
+ */
+const InitialRepositoryIndicatorTimeout = 2 * 60 * 1000
+
+const MaxInvalidFoldersToDisplay = 3
 
 export class AppStore extends TypedBaseStore<IAppState> {
   private readonly gitStoreCache: GitStoreCache
@@ -303,13 +335,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
   /** The background fetcher for the currently selected repository. */
   private currentBackgroundFetcher: BackgroundFetcher | null = null
 
-  /** The pull request updater for the currently selected repository */
-  private currentPullRequestUpdater: PullRequestUpdater | null = null
-
   /** The ahead/behind updater or the currently selected repository */
   private currentAheadBehindUpdater: AheadBehindUpdater | null = null
 
   private currentBranchPruner: BranchPruner | null = null
+
+  private readonly repositoryIndicatorUpdater: RepositoryIndicatorUpdater
 
   private showWelcomeFlow = false
   private focusCommitMessage = false
@@ -358,8 +389,11 @@ export class AppStore extends TypedBaseStore<IAppState> {
   private askForConfirmationOnForcePush = askForConfirmationOnForcePushDefault
   private imageDiffType: ImageDiffType = imageDiffTypeDefault
   private hideWhitespaceInDiff: boolean = hideWhitespaceInDiffDefault
+  private showSideBySideDiff: boolean = ShowSideBySideDiffDefault
 
-  private selectedExternalEditor?: ExternalEditor
+  private uncommittedChangesStrategy = defaultUncommittedChangesStrategy
+
+  private selectedExternalEditor: ExternalEditor | null = null
 
   private resolvedExternalEditor: ExternalEditor | null = null
 
@@ -384,6 +418,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
   private hasUserViewedStash = false
 
+  private repositoryIndicatorsEnabled: boolean
+
+  /** Which step the user needs to complete next in the onboarding tutorial */
+  private currentOnboardingTutorialStep = TutorialStep.NotApplicable
+  private readonly tutorialAssessor: OnboardingTutorialAssessor
+
   public constructor(
     private readonly gitHubUserStore: GitHubUserStore,
     private readonly cloningRepositoriesStore: CloningRepositoriesStore,
@@ -392,7 +432,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
     private readonly signInStore: SignInStore,
     private readonly accountsStore: AccountsStore,
     private readonly repositoriesStore: RepositoriesStore,
-    private readonly pullRequestStore: PullRequestStore,
+    private readonly pullRequestCoordinator: PullRequestCoordinator,
     private readonly repositoryStateCache: RepositoryStateCache,
     private readonly apiRepositoriesStore: ApiRepositoriesStore
   ) {
@@ -402,25 +442,130 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
     this.gitStoreCache = new GitStoreCache(
       shell,
+      this.statsStore,
       (repo, store) => this.onGitStoreUpdated(repo, store),
-      (repo, commits) => this.loadAndCacheUsers(repo, this.accounts, commits),
       error => this.emitError(error)
     )
 
-    const window = remote.getCurrentWindow()
-    this.windowState = getWindowState(window)
+    const browserWindow = remote.getCurrentWindow()
+    this.windowState = getWindowState(browserWindow)
 
-    this.onWindowZoomFactorChanged(window.webContents.getZoomFactor())
+    this.onWindowZoomFactorChanged(browserWindow.webContents.zoomFactor)
 
-    this.wireupIpcEventHandlers(window)
+    this.wireupIpcEventHandlers(browserWindow)
     this.wireupStoreEventHandlers()
     getAppMenu()
+    this.tutorialAssessor = new OnboardingTutorialAssessor(
+      this.getResolvedExternalEditor
+    )
+
+    // We're considering flipping the default value and have new users
+    // start off with repository indicators disabled. As such we'll start
+    // persisting the current default to localstorage right away so we
+    // can change the default in the future without affecting current
+    // users.
+    if (getBoolean(repositoryIndicatorsEnabledKey) === undefined) {
+      setBoolean(repositoryIndicatorsEnabledKey, true)
+    }
+
+    this.repositoryIndicatorsEnabled =
+      getBoolean(repositoryIndicatorsEnabledKey) ?? true
+
+    this.repositoryIndicatorUpdater = new RepositoryIndicatorUpdater(
+      this.getRepositoriesForIndicatorRefresh,
+      this.refreshIndicatorForRepository
+    )
+
+    window.setTimeout(() => {
+      if (this.repositoryIndicatorsEnabled) {
+        this.repositoryIndicatorUpdater.start()
+      }
+    }, InitialRepositoryIndicatorTimeout)
+  }
+
+  /** Figure out what step of the tutorial the user needs to do next */
+  private async updateCurrentTutorialStep(
+    repository: Repository
+  ): Promise<void> {
+    const currentStep = await this.tutorialAssessor.getCurrentStep(
+      repository.isTutorialRepository,
+      this.repositoryStateCache.get(repository)
+    )
+    // only emit an update if its changed
+    if (currentStep !== this.currentOnboardingTutorialStep) {
+      this.currentOnboardingTutorialStep = currentStep
+      log.info(`Current tutorial step is now ${currentStep}`)
+      this.recordTutorialStepCompleted(currentStep)
+      this.emitUpdate()
+    }
+  }
+
+  private recordTutorialStepCompleted(step: TutorialStep): void {
+    if (!isValidTutorialStep(step)) {
+      return
+    }
+
+    this.statsStore.recordHighestTutorialStepCompleted(
+      orderedTutorialSteps.indexOf(step)
+    )
+
+    switch (step) {
+      case TutorialStep.PickEditor:
+        // don't need to record anything for the first step
+        break
+      case TutorialStep.CreateBranch:
+        this.statsStore.recordTutorialEditorInstalled()
+        break
+      case TutorialStep.EditFile:
+        this.statsStore.recordTutorialBranchCreated()
+        break
+      case TutorialStep.MakeCommit:
+        this.statsStore.recordTutorialFileEdited()
+        break
+      case TutorialStep.PushBranch:
+        this.statsStore.recordTutorialCommitCreated()
+        break
+      case TutorialStep.OpenPullRequest:
+        this.statsStore.recordTutorialBranchPushed()
+        break
+      case TutorialStep.AllDone:
+        this.statsStore.recordTutorialPrCreated()
+        this.statsStore.recordTutorialCompleted()
+        break
+      default:
+        assertNever(step, 'Unaccounted for step type')
+    }
+  }
+
+  public async _resumeTutorial(repository: Repository) {
+    this.tutorialAssessor.resumeTutorial()
+    await this.updateCurrentTutorialStep(repository)
+  }
+
+  public async _pauseTutorial(repository: Repository) {
+    this.tutorialAssessor.pauseTutorial()
+    await this.updateCurrentTutorialStep(repository)
+  }
+
+  /** Call via `Dispatcher` when the user opts to skip the pick editor step of the onboarding tutorial */
+  public async _skipPickEditorTutorialStep(repository: Repository) {
+    this.tutorialAssessor.skipPickEditor()
+    await this.updateCurrentTutorialStep(repository)
+  }
+
+  /**
+   * Call  via `Dispatcher` when the user has either created a pull request or opts to
+   * skip the create pull request step of the onboarding tutorial
+   */
+  public async _markPullRequestTutorialStepAsComplete(repository: Repository) {
+    this.tutorialAssessor.markPullRequestTutorialStepAsComplete()
+    await this.updateCurrentTutorialStep(repository)
   }
 
   private wireupIpcEventHandlers(window: Electron.BrowserWindow) {
     ipcRenderer.on(
       windowStateChannelName,
-      (event: Electron.IpcMessageEvent, windowState: WindowState) => {
+      (event: Electron.IpcRendererEvent, windowState: WindowState) => {
         this.windowState = windowState
         this.emitUpdate()
       }
@@ -432,7 +577,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
     ipcRenderer.on(
       'app-menu',
-      (event: Electron.IpcMessageEvent, { menu }: { menu: IMenu }) => {
+      (event: Electron.IpcRendererEvent, { menu }: { menu: IMenu }) => {
         this.setAppMenu(menu)
       }
     )
@@ -465,23 +610,17 @@ export class AppStore extends TypedBaseStore<IAppState> {
     })
     this.accountsStore.onDidError(error => this.emitError(error))
 
-    this.repositoriesStore.onDidUpdate(async () => {
-      this.repositories = await this.repositoriesStore.getAll()
+    this.repositoriesStore.onDidUpdate(updateRepositories => {
+      this.repositories = updateRepositories
       this.updateRepositorySelectionAfterRepositoriesChanged()
       this.emitUpdate()
     })
 
-    this.pullRequestStore.onPullRequestsChanged((ghRepo, pullRequests) =>
-      this.onPullRequestChanged(ghRepo, pullRequests)
+    this.pullRequestCoordinator.onPullRequestsChanged((repo, pullRequests) =>
+      this.onPullRequestChanged(repo, pullRequests)
     )
-    this.pullRequestStore.onIsLoadingPullRequests(
-      (ghRepo, isLoadingPullRequests) => {
-        const repository = this.findRepositoryByGitHubRepository(ghRepo)
-
-        if (!repository) {
-          return
-        }
-
+    this.pullRequestCoordinator.onIsLoadingPullRequests(
+      (repository, isLoadingPullRequests) => {
         this.repositoryStateCache.updateBranchesState(repository, () => {
           return { isLoadingPullRequests }
         })
@@ -607,8 +746,6 @@ export class AppStore extends TypedBaseStore<IAppState> {
       commitSummaryWidth: this.commitSummaryWidth,
       stashedFilesWidth: this.stashedFilesWidth,
       appMenuState: this.appMenu ? this.appMenu.openMenus : [],
-      titleBarStyle:
-        this.showWelcomeFlow || repositories.length === 0 ? 'light' : 'dark',
       highlightAccessKeys: this.highlightAccessKeys,
       isUpdateAvailableBannerVisible: this.isUpdateAvailableBannerVisible,
       currentBanner: this.currentBanner,
@@ -616,9 +753,11 @@ export class AppStore extends TypedBaseStore<IAppState> {
         .askForConfirmationOnRepositoryRemoval,
       askForConfirmationOnDiscardChanges: this.confirmDiscardChanges,
       askForConfirmationOnForcePush: this.askForConfirmationOnForcePush,
+      uncommittedChangesStrategy: this.uncommittedChangesStrategy,
       selectedExternalEditor: this.selectedExternalEditor,
       imageDiffType: this.imageDiffType,
       hideWhitespaceInDiff: this.hideWhitespaceInDiff,
+      showSideBySideDiff: this.showSideBySideDiff,
       selectedShell: this.selectedShell,
       repositoryFilterText: this.repositoryFilterText,
       resolvedExternalEditor: this.resolvedExternalEditor,
@@ -628,6 +767,8 @@ export class AppStore extends TypedBaseStore<IAppState> {
       automaticallySwitchTheme: this.automaticallySwitchTheme,
       apiRepositories: this.apiRepositoriesStore.getState(),
       optOutOfUsageTracking: this.statsStore.getOptOut(),
+      currentOnboardingTutorialStep: this.currentOnboardingTutorialStep,
+      repositoryIndicatorsEnabled: this.repositoryIndicatorsEnabled,
     }
   }
 
@@ -659,15 +800,23 @@ export class AppStore extends TypedBaseStore<IAppState> {
           if (
             !currentPullRequest ||
             !isPullRequestAssociatedWithBranch(
-              remote,
               branch,
-              currentPullRequest
+              currentPullRequest,
+              remote
             )
           ) {
             // Either we don't have a current pull request or the current pull
             // request no longer matches the tip, let's go hunting for a new one.
             const prs = state.openPullRequests
             currentPullRequest = findAssociatedPullRequest(branch, prs, remote)
+          }
+
+          if (
+            tip.kind === TipState.Valid &&
+            state.tip.kind === TipState.Valid &&
+            tip.branch.name !== state.tip.branch.name
+          ) {
+            this.refreshBranchProtectionState(repository)
           }
         }
       }
@@ -693,7 +842,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       if (state.selection.kind === ChangesSelectionKind.Stash) {
         if (state.stashEntry !== null) {
           if (stashEntry === null) {
-            // We're showing a stash now and the stash entry has just dissapeared
+            // We're showing a stash now and the stash entry has just disappeared
             // so we need to switch back over to the working directory.
             selectWorkingDirectory = true
           } else if (state.stashEntry.stashSha !== stashEntry.stashSha) {
@@ -715,7 +864,9 @@ export class AppStore extends TypedBaseStore<IAppState> {
     this.repositoryStateCache.update(repository, () => ({
       commitLookup: gitStore.commitLookup,
       localCommitSHAs: gitStore.localCommitSHAs,
+      localTags: gitStore.localTags,
       aheadBehind: gitStore.aheadBehind,
+      tagsToPush: gitStore.tagsToPush,
       remote: gitStore.currentRemote,
       lastFetched: gitStore.lastFetched,
     }))
@@ -731,32 +882,56 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
   }
 
+  private clearBranchProtectionState(repository: Repository) {
+    this.repositoryStateCache.updateChangesState(repository, () => ({
+      currentBranchProtected: false,
+    }))
+    this.emitUpdate()
+  }
+
   private async refreshBranchProtectionState(repository: Repository) {
-    if (!enableBranchProtectionWarningFlow()) {
+    const { tip, currentRemote } = this.gitStoreCache.get(repository)
+
+    if (tip.kind !== TipState.Valid || repository.gitHubRepository === null) {
       return
     }
 
-    const gitStore = this.gitStoreCache.get(repository)
+    const gitHubRepo = repository.gitHubRepository
+    const branchName = findRemoteBranchName(tip, currentRemote, gitHubRepo)
 
-    if (
-      gitStore.tip.kind === TipState.Valid &&
-      repository.gitHubRepository !== null
-    ) {
-      const branchName = findRemoteBranchName(
-        gitStore.tip,
-        gitStore.currentRemote,
-        repository.gitHubRepository
-      )
+    if (branchName !== null) {
+      const account = getAccountForEndpoint(this.accounts, gitHubRepo.endpoint)
 
-      if (branchName !== null) {
-        const currentBranchProtected = await this.repositoriesStore.isBranchProtectedOnRemote(
-          repository.gitHubRepository,
-          branchName
-        )
-        this.repositoryStateCache.updateChangesState(repository, () => ({
-          currentBranchProtected,
-        }))
+      if (account === null) {
+        return
       }
+
+      // If the user doesn't have write access to the repository
+      // it doesn't matter if the branch is protected or not and
+      // we can avoid the API call. See the `showNoWriteAccess`
+      // prop in the `CommitMessage` component where we specifically
+      // test for this scenario and show a message specifically
+      // about write access before showing a branch protection
+      // warning.
+      if (!hasWritePermission(gitHubRepo)) {
+        this.repositoryStateCache.updateChangesState(repository, () => ({
+          currentBranchProtected: false,
+        }))
+        this.emitUpdate()
+        return
+      }
+
+      const name = gitHubRepo.name
+      const owner = gitHubRepo.owner.login
+      const api = API.fromAccount(account)
+
+      const pushControl = await api.fetchPushControl(owner, name, branchName)
+      const currentBranchProtected = !isBranchPushable(pushControl)
+
+      this.repositoryStateCache.updateChangesState(repository, () => ({
+        currentBranchProtected,
+      }))
+      this.emitUpdate()
     }
   }
 
@@ -815,12 +990,8 @@ export class AppStore extends TypedBaseStore<IAppState> {
   private startAheadBehindUpdater(repository: Repository) {
     if (this.currentAheadBehindUpdater != null) {
       fatalError(
-        `An ahead/behind updater is already active and cannot start updating on ${
-          repository.name
-        }`
+        `An ahead/behind updater is already active and cannot start updating on ${repository.name}`
       )
-
-      return
     }
 
     const updater = new AheadBehindUpdater(repository, aheadBehindCache => {
@@ -852,7 +1023,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
     const state = this.repositoryStateCache.get(repository)
 
     const { branchesState, compareState } = state
-    const { tip, currentPullRequest } = branchesState
+    const { tip } = branchesState
     const currentBranch = tip.kind === TipState.Valid ? tip.branch : null
 
     const allBranches =
@@ -874,53 +1045,11 @@ export class AppStore extends TypedBaseStore<IAppState> {
         ? cachedDefaultBranch
         : null
 
-    let inferredBranch: Branch | null = null
-    let aheadBehindOfInferredBranch: IAheadBehind | null = null
-    if (tip.kind === TipState.Valid && compareState.aheadBehindCache !== null) {
-      inferredBranch = await inferComparisonBranch(
-        repository,
-        allBranches,
-        currentPullRequest,
-        tip.branch,
-        getRemotes,
-        compareState.aheadBehindCache
-      )
-
-      if (inferredBranch !== null) {
-        aheadBehindOfInferredBranch = compareState.aheadBehindCache.get(
-          tip.branch.tip.sha,
-          inferredBranch.tip.sha
-        )
-      }
-    }
-
     this.repositoryStateCache.updateCompareState(repository, () => ({
       allBranches,
       recentBranches,
       defaultBranch,
-      inferredComparisonBranch: {
-        branch: inferredBranch,
-        aheadBehind: aheadBehindOfInferredBranch,
-      },
     }))
-
-    if (inferredBranch !== null) {
-      const currentCount = getBehindOrDefault(aheadBehindOfInferredBranch)
-
-      const prevInferredBranchState =
-        state.compareState.inferredComparisonBranch
-
-      const previousCount = getBehindOrDefault(
-        prevInferredBranchState.aheadBehind
-      )
-
-      // we only want to show the banner when the the number
-      // commits behind has changed since the last it was visible
-      const countChanged = currentCount > 0 && previousCount !== currentCount
-      this._setDivergingBranchBannerVisibility(repository, countChanged)
-    } else {
-      this._setDivergingBranchBannerVisibility(repository, false)
-    }
 
     const cachedState = compareState.formState
     const action =
@@ -1063,7 +1192,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       this.currentAheadBehindUpdater.insert(from, to, aheadBehind)
     }
 
-    const loadingMerge: MergeResult = {
+    const loadingMerge: MergeTreeResult = {
       kind: ComputedAction.Loading,
     }
 
@@ -1086,9 +1215,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       )
         .catch(err => {
           log.warn(
-            `Error occurred while trying to merge ${tip.branch.name} (${
-              tip.branch.tip.sha
-            }) and ${action.branch.name} (${action.branch.tip.sha})`,
+            `Error occurred while trying to merge ${tip.branch.name} (${tip.branch.tip.sha}) and ${action.branch.name} (${action.branch.tip.sha})`,
             err
           )
           return null
@@ -1263,7 +1390,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       repository,
       file,
       sha,
-      enableHideWhitespaceInDiffOption() ? this.hideWhitespaceInDiff : false
+      this.hideWhitespaceInDiff
     )
 
     const stateAfterLoad = this.repositoryStateCache.get(repository)
@@ -1294,6 +1421,18 @@ export class AppStore extends TypedBaseStore<IAppState> {
   ): Promise<Repository | null> {
     const previouslySelectedRepository = this.selectedRepository
 
+    // do this quick check to see if we have a tutorial repository
+    // cause if its not we can quickly hide the tutorial pane
+    // in the first `emitUpdate` below
+    const previouslyInTutorial =
+      this.currentOnboardingTutorialStep !== TutorialStep.NotApplicable
+    if (
+      previouslyInTutorial &&
+      (!(repository instanceof Repository) || !repository.isTutorialRepository)
+    ) {
+      this.currentOnboardingTutorialStep = TutorialStep.NotApplicable
+    }
+
     this.selectedRepository = repository
 
     this.emitUpdate()
@@ -1315,9 +1454,8 @@ export class AppStore extends TypedBaseStore<IAppState> {
     const previousRepositoryId = previouslySelectedRepository
       ? previouslySelectedRepository.id
       : null
-    if (enableGroupRepositoriesByOwner()) {
-      this.updateRecentRepositories(previousRepositoryId, repository.id)
-    }
+
+    this.updateRecentRepositories(previousRepositoryId, repository.id)
 
     // if repository might be marked missing, try checking if it has been restored
     const refreshedRepository = await this.recoverMissingRepository(repository)
@@ -1328,6 +1466,11 @@ export class AppStore extends TypedBaseStore<IAppState> {
       this.gitStoreCache.remove(repository)
       return Promise.resolve(null)
     }
+
+    // This is now purely for metrics collection for `commitsToRepositoryWithBranchProtections`
+    // Understanding how many users actually contribute to repos with branch protections gives us
+    // insight into who our users are and what kinds of work they do
+    this.updateBranchProtectionsFromAPI(repository)
 
     return this._selectRepositoryRefreshTasks(
       refreshedRepository,
@@ -1340,7 +1483,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
     previousRepositoryId: number | null,
     currentRepositoryId: number
   ) {
-    const recentRepositories = this.getStoredRecentRepositories().filter(
+    const recentRepositories = getNumberArray(RecentRepositoriesKey).filter(
       el => el !== currentRepositoryId && el !== previousRepositoryId
     )
     if (previousRepositoryId !== null) {
@@ -1350,28 +1493,9 @@ export class AppStore extends TypedBaseStore<IAppState> {
       0,
       RecentRepositoriesLength
     )
-    localStorage.setItem(
-      RecentRepositoriesKey,
-      slicedRecentRepositories.join(RecentRepositoriesDelimiter)
-    )
+    setNumberArray(RecentRepositoriesKey, slicedRecentRepositories)
     this.recentRepositories = slicedRecentRepositories
     this.emitUpdate()
-  }
-
-  private getStoredRecentRepositories() {
-    const storedIds = localStorage.getItem(RecentRepositoriesKey)
-    let storedRepositories: Array<number> = []
-    if (storedIds) {
-      try {
-        storedRepositories = storedIds
-          .split(RecentRepositoriesDelimiter)
-          .map(n => parseInt(n, 10))
-          .filter(n => !isNaN(n))
-      } catch {
-        storedRepositories = []
-      }
-    }
-    return storedRepositories
   }
 
   // finish `_selectRepository`s refresh tasks
@@ -1381,12 +1505,16 @@ export class AppStore extends TypedBaseStore<IAppState> {
   ): Promise<Repository | null> {
     this._refreshRepository(repository)
 
-    const gitHubRepository = repository.gitHubRepository
+    if (isRepositoryWithGitHubRepository(repository)) {
+      // Load issues from the upstream or fork depending
+      // on workflow preferences.
+      const ghRepo = getNonForkGitHubRepository(repository)
 
-    if (gitHubRepository !== null) {
-      this._refreshIssues(gitHubRepository)
-      this.pullRequestStore.getAll(gitHubRepository).then(prs => {
-        this.onPullRequestChanged(gitHubRepository, prs)
+      this._refreshIssues(ghRepo)
+      this.refreshMentionables(ghRepo)
+
+      this.pullRequestCoordinator.getAllPullRequests(repository).then(prs => {
+        this.onPullRequestChanged(repository, prs)
       })
     }
 
@@ -1407,7 +1535,6 @@ export class AppStore extends TypedBaseStore<IAppState> {
     this.startPullRequestUpdater(repository)
 
     this.startAheadBehindUpdater(repository)
-    this.refreshMentionables(repository)
     this.startBackgroundPruner(repository)
 
     this.addUpstreamRemoteIfNeeded(repository)
@@ -1427,25 +1554,19 @@ export class AppStore extends TypedBaseStore<IAppState> {
   private startBackgroundPruner(repository: Repository) {
     if (this.currentBranchPruner !== null) {
       fatalError(
-        `A branch pruner is already active and cannot start updating on ${
-          repository.name
-        }`
+        `A branch pruner is already active and cannot start updating on ${repository.name}`
       )
-
-      return
     }
 
-    if (enableBranchPruning()) {
-      const pruner = new BranchPruner(
-        repository,
-        this.gitStoreCache,
-        this.repositoriesStore,
-        this.repositoryStateCache,
-        repository => this._refreshRepository(repository)
-      )
-      this.currentBranchPruner = pruner
-      this.currentBranchPruner.start()
-    }
+    const pruner = new BranchPruner(
+      repository,
+      this.gitStoreCache,
+      this.repositoriesStore,
+      this.repositoryStateCache,
+      repository => this._refreshRepository(repository)
+    )
+    this.currentBranchPruner = pruner
+    this.currentBranchPruner.start()
   }
 
   public async _refreshIssues(repository: GitHubRepository) {
@@ -1469,59 +1590,55 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
   }
 
-  private refreshMentionables(repository: Repository) {
-    const account = getAccountForRepository(this.accounts, repository)
+  private refreshMentionables(repository: GitHubRepository) {
+    const account = getAccountForEndpoint(this.accounts, repository.endpoint)
     if (!account) {
       return
     }
 
-    const gitHubRepository = repository.gitHubRepository
-    if (!gitHubRepository) {
-      return
-    }
-
-    this.gitHubUserStore.updateMentionables(gitHubRepository, account)
+    this.gitHubUserStore.updateMentionables(repository, account)
   }
 
   private startPullRequestUpdater(repository: Repository) {
-    if (this.currentPullRequestUpdater) {
-      this.stopPullRequestUpdater()
-    }
-
     // We don't want to run the pull request updater when the app is in
     // the background.
-    if (!this.appIsFocused) {
-      return
+    if (this.appIsFocused && isRepositoryWithGitHubRepository(repository)) {
+      const account = getAccountForRepository(this.accounts, repository)
+      if (account !== null) {
+        return this.pullRequestCoordinator.startPullRequestUpdater(
+          repository,
+          account
+        )
+      }
     }
-
-    const account = getAccountForRepository(this.accounts, repository)
-    const { gitHubRepository } = repository
-
-    if (account === null || gitHubRepository === null) {
-      return
-    }
-
-    this.currentPullRequestUpdater = new PullRequestUpdater(
-      gitHubRepository,
-      account,
-      this.pullRequestStore
-    )
-    this.currentPullRequestUpdater.start()
+    // we always want to stop the current one, to be safe
+    this.pullRequestCoordinator.stopPullRequestUpdater()
   }
 
   private stopPullRequestUpdater() {
-    if (this.currentPullRequestUpdater) {
-      this.currentPullRequestUpdater.stop()
-      this.currentPullRequestUpdater = null
-    }
+    this.pullRequestCoordinator.stopPullRequestUpdater()
   }
 
-  private shouldBackgroundFetch(
+  public async fetchPullRequest(repoUrl: string, pr: string) {
+    const endpoint = getEndpointForRepository(repoUrl)
+    const account = getAccountForEndpoint(this.accounts, endpoint)
+
+    if (account) {
+      const api = API.fromAccount(account)
+      const remoteUrl = parseRemote(repoUrl)
+      if (remoteUrl && remoteUrl.owner && remoteUrl.name) {
+        return await api.fetchPullRequest(remoteUrl.owner, remoteUrl.name, pr)
+      }
+    }
+    return null
+  }
+
+  private async shouldBackgroundFetch(
     repository: Repository,
     lastPush: Date | null
-  ): boolean {
+  ): Promise<boolean> {
     const gitStore = this.gitStoreCache.get(repository)
-    const lastFetched = gitStore.lastFetched
+    const lastFetched = await gitStore.updateLastFetched()
 
     if (lastFetched === null) {
       return true
@@ -1561,11 +1678,8 @@ export class AppStore extends TypedBaseStore<IAppState> {
   ) {
     if (this.currentBackgroundFetcher) {
       fatalError(
-        `We should only have on background fetcher active at once, but we're trying to start background fetching on ${
-          repository.name
-        } while another background fetcher is still active!`
+        `We should only have on background fetcher active at once, but we're trying to start background fetching on ${repository.name} while another background fetcher is still active!`
       )
-      return
     }
 
     const account = getAccountForRepository(this.accounts, repository)
@@ -1606,26 +1720,6 @@ export class AppStore extends TypedBaseStore<IAppState> {
     this.accounts = accounts
     this.repositories = repositories
 
-    // doing this that the current user can be found by any of their email addresses
-    for (const account of accounts) {
-      const userAssociations: ReadonlyArray<IGitHubUser> = account.emails.map(
-        email =>
-          // NB: We're not using object spread here because `account` has more
-          // keys than we want.
-          ({
-            endpoint: account.endpoint,
-            email: email.email,
-            login: account.login,
-            avatarURL: account.avatarURL,
-            name: account.name,
-          })
-      )
-
-      for (const user of userAssociations) {
-        this.gitHubUserStore.cacheUser(user)
-      }
-    }
-
     this.updateRepositorySelectionAfterRepositoriesChanged()
 
     this.sidebarWidth = getNumber(sidebarWidthConfigKey, defaultSidebarWidth)
@@ -1653,10 +1747,13 @@ export class AppStore extends TypedBaseStore<IAppState> {
       askForConfirmationOnForcePushDefault
     )
 
-    const externalEditorValue = await this.getSelectedExternalEditor()
-    if (externalEditorValue) {
-      this.selectedExternalEditor = externalEditorValue
-    }
+    this.uncommittedChangesStrategy =
+      getEnum(uncommittedChangesStrategyKey, UncommittedChangesStrategy) ??
+      defaultUncommittedChangesStrategy
+
+    this.updateSelectedExternalEditor(
+      await this.lookupSelectedExternalEditor()
+    ).catch(e => log.error('Failed resolving current editor at startup', e))
 
     const shellValue = localStorage.getItem(shellKey)
     this.selectedShell = shellValue ? parseShell(shellValue) : DefaultShell
@@ -1670,6 +1767,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
         : parseInt(imageDiffTypeValue)
 
     this.hideWhitespaceInDiff = getBoolean(hideWhitespaceInDiffKey, false)
+    this.showSideBySideDiff = getShowSideBySideDiff()
 
     this.automaticallySwitchTheme = getAutoSwitchPersistedTheme()
 
@@ -1694,18 +1792,30 @@ export class AppStore extends TypedBaseStore<IAppState> {
     this.accountsStore.refresh()
   }
 
-  private async getSelectedExternalEditor(): Promise<ExternalEditor | null> {
+  private updateSelectedExternalEditor(
+    selectedEditor: ExternalEditor | null
+  ): Promise<void> {
+    this.selectedExternalEditor = selectedEditor
+
+    // Make sure we keep the resolved (cached) editor
+    // in sync when the user changes their editor choice.
+    return this._resolveCurrentEditor()
+  }
+
+  private async lookupSelectedExternalEditor(): Promise<ExternalEditor | null> {
+    const editors = (await getAvailableEditors()).map(found => found.editor)
+
     const externalEditorValue = localStorage.getItem(externalEditorKey)
     if (externalEditorValue) {
       const value = parse(externalEditorValue)
-      if (value) {
+      // ensure editor is still installed
+      if (value && editors.includes(value)) {
         return value
       }
     }
 
-    const editors = await getAvailableEditors()
     if (editors.length) {
-      const value = editors[0].editor
+      const value = editors[0]
       // store this value to avoid the lookup next time
       localStorage.setItem(externalEditorKey, value)
       return value
@@ -1750,7 +1860,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
     const labels: MenuLabelsEvent = {
       selectedShell,
-      selectedExternalEditor: selectedExternalEditor || null,
+      selectedExternalEditor,
       askForConfirmationOnRepositoryRemoval,
       askForConfirmationOnForcePush,
     }
@@ -1776,12 +1886,16 @@ export class AppStore extends TypedBaseStore<IAppState> {
     const isStashedChangesVisible =
       changesState.selection.kind === ChangesSelectionKind.Stash
 
+    const askForConfirmationWhenStashingAllChanges =
+      changesState.stashEntry !== null
+
     updatePreferredAppMenuItemLabels({
       ...labels,
       defaultBranchName,
       isForcePushForCurrentRepository,
       isStashedChangesVisible,
       hasCurrentPullRequest: currentPullRequest !== null,
+      askForConfirmationWhenStashingAllChanges,
     })
   }
 
@@ -2009,12 +2123,13 @@ export class AppStore extends TypedBaseStore<IAppState> {
     repository: Repository,
     selectedSection: RepositorySectionTab
   ): Promise<void> {
-    this.repositoryStateCache.update(repository, () => ({
-      selectedSection,
-    }))
+    this.repositoryStateCache.update(repository, state => {
+      if (state.selectedSection !== selectedSection) {
+        this.statsStore.recordRepositoryViewChanged()
+      }
+      return { selectedSection }
+    })
     this.emitUpdate()
-
-    this._hideStashedChanges(repository)
 
     if (selectedSection === RepositorySectionTab.History) {
       return this.refreshHistorySection(repository)
@@ -2128,7 +2243,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
 
     const selectableLines = new Set<number>()
-    if (diff.kind === DiffType.Text) {
+    if (diff.kind === DiffType.Text || diff.kind === DiffType.LargeText) {
       // The diff might have changed dramatically since last we loaded it.
       // Ideally we would be more clever about validating that any partial
       // selection state is still valid by ensuring that selected lines still
@@ -2166,6 +2281,13 @@ export class AppStore extends TypedBaseStore<IAppState> {
   }
 
   public _hideStashedChanges(repository: Repository) {
+    const { changesState } = this.repositoryStateCache.get(repository)
+
+    // makes this safe to call even when the stash ui is not visible
+    if (changesState.selection.kind !== ChangesSelectionKind.Stash) {
+      return
+    }
+
     this.repositoryStateCache.updateChangesState(repository, state => {
       const files = state.workingDirectory.files
       const selectedFileIds = files
@@ -2369,9 +2491,10 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
           const { commitAuthor } = state
           if (commitAuthor !== null) {
-            const commitEmailMatchesAccount = account.emails.some(
-              email =>
-                email.email.toLowerCase() === commitAuthor.email.toLowerCase()
+            const commitEmail = commitAuthor.email.toLowerCase()
+            const attributableEmails = getAttributableEmailsFor(account)
+            const commitEmailMatchesAccount = attributableEmails.some(
+              email => email.toLowerCase() === commitEmail
             )
             if (!commitEmailMatchesAccount) {
               this.statsStore.recordUnattributedCommit()
@@ -2379,31 +2502,35 @@ export class AppStore extends TypedBaseStore<IAppState> {
           }
         }
 
-        if (enableBranchProtectionChecks()) {
-          const branchProtectionsFound = await this.repositoriesStore.hasBranchProtectionsConfigured(
-            repository.gitHubRepository
-          )
+        const branchProtectionsFound = await this.repositoriesStore.hasBranchProtectionsConfigured(
+          repository.gitHubRepository
+        )
 
-          if (branchProtectionsFound) {
-            this.statsStore.recordCommitToRepositoryWithBranchProtections()
+        if (branchProtectionsFound) {
+          this.statsStore.recordCommitToRepositoryWithBranchProtections()
+        }
+
+        const branchName = findRemoteBranchName(
+          gitStore.tip,
+          gitStore.currentRemote,
+          repository.gitHubRepository
+        )
+
+        if (branchName !== null) {
+          const { changesState } = this.repositoryStateCache.get(repository)
+          if (changesState.currentBranchProtected) {
+            this.statsStore.recordCommitToProtectedBranch()
           }
+        }
 
-          const branchName = findRemoteBranchName(
-            gitStore.tip,
-            gitStore.currentRemote,
-            repository.gitHubRepository
+        if (
+          repository.gitHubRepository !== null &&
+          !hasWritePermission(repository.gitHubRepository)
+        ) {
+          this.statsStore.recordCommitToRepositoryWithoutWriteAccess()
+          this.statsStore.recordRepositoryCommitedInWithoutWriteAccess(
+            repository.gitHubRepository.dbID
           )
-
-          if (branchName !== null) {
-            const isRemoteBranchProtected = await this.repositoriesStore.isBranchProtectedOnRemote(
-              repository.gitHubRepository,
-              branchName
-            )
-
-            if (isRemoteBranchProtected) {
-              this.statsStore.recordCommitToProtectedBranch()
-            }
-          }
         }
       }
 
@@ -2562,9 +2689,10 @@ export class AppStore extends TypedBaseStore<IAppState> {
       gitStore.updateLastFetched(),
       gitStore.loadStashEntries(),
       this.refreshAuthor(repository),
-      this.refreshBranchProtectionState(repository),
       refreshSectionPromise,
     ])
+
+    await gitStore.refreshTags()
 
     // this promise is fire-and-forget, so no need to await it
     this.updateStashEntryCountMetric(
@@ -2578,6 +2706,8 @@ export class AppStore extends TypedBaseStore<IAppState> {
     this.updateMenuItemLabels(latestState)
 
     this._initializeCompare(repository)
+
+    this.updateCurrentTutorialStep(repository)
   }
 
   private async updateStashEntryCountMetric(
@@ -2626,38 +2756,10 @@ export class AppStore extends TypedBaseStore<IAppState> {
       changedFilesCount: status.workingDirectory.files.length,
     })
   }
-
-  /**
-   * Refresh sidebar indicators for the set of repositories tracked in the app.
-   */
-  public async refreshAllSidebarIndicators() {
-    const startTime = performance && performance.now ? performance.now() : null
-
-    // keep a reference to the current set of repositories to avoid the array
-    // changing while this is running
-    const repositories = new Array<Repository>(...this.repositories)
-
-    for (const repo of repositories) {
-      await this.refreshIndicatorForRepository(repo)
-    }
-
-    if (startTime && repositories.length > 1) {
-      const delta = performance.now() - startTime
-      const timeInSeconds = (delta / 1000).toFixed(3)
-      log.info(
-        `Background fetch for ${
-          repositories.length
-        } repositories took ${timeInSeconds}sec`
-      )
-    }
-
-    this.emitUpdate()
-  }
-
   /**
    * Refresh indicator in repository list for a specific repository
    */
-  private async refreshIndicatorForRepository(repository: Repository) {
+  private refreshIndicatorForRepository = async (repository: Repository) => {
     const lookup = this.localRepositoryStateLookup
 
     if (repository.missing) {
@@ -2678,20 +2780,81 @@ export class AppStore extends TypedBaseStore<IAppState> {
       return
     }
 
+    this.updateSidebarIndicator(repository, status)
+    this.emitUpdate()
+
     const lastPush = await inferLastPushForRepository(
       this.accounts,
       gitStore,
       repository
     )
 
-    if (this.shouldBackgroundFetch(repository, lastPush)) {
-      await this._fetch(repository, FetchType.BackgroundTask)
+    if (await this.shouldBackgroundFetch(repository, lastPush)) {
+      const aheadBehind = await this.fetchForRepositoryIndicator(repository)
+
+      const existing = lookup.get(repository.id)
+      lookup.set(repository.id, {
+        aheadBehind: aheadBehind,
+        // We don't need to update changedFilesCount here since it was already
+        // set when calling `updateSidebarIndicator()` with the status object.
+        changedFilesCount: existing?.changedFilesCount ?? 0,
+      })
+      this.emitUpdate()
+    }
+  }
+
+  private getRepositoriesForIndicatorRefresh = () => {
+    // The currently selected repository will get refreshed by both the
+    // BackgroundFetcher and the refreshRepository call from the
+    // focus event. No point in having the RepositoryIndicatorUpdater do
+    // it as well.
+    //
+    // Note that this method should never leak the actual repositories
+    // instance since that's a mutable array. We should always return
+    // a copy.
+    return this.repositories.filter(x => x !== this.selectedRepository)
+  }
+
+  /**
+   * A slimmed down version of performFetch which is only used when fetching
+   * the repository in order to compute the repository indicator status.
+   *
+   * As opposed to `performFetch` this method will not perform a full refresh
+   * of the repository after fetching, nor will it refresh issues, branch
+   * protection information etc. It's intention is to only do the bare minimum
+   * amount of work required to calculate an up-to-date ahead/behind status
+   * of the current branch to its upstream tracking branch.
+   */
+  private fetchForRepositoryIndicator(repo: Repository) {
+    return this.withAuthenticatingUser(repo, async (repo, account) => {
+      const isBackgroundTask = true
+      const gitStore = this.gitStoreCache.get(repo)
+
+      await this.withPushPullFetch(repo, () =>
+        gitStore.fetch(account, isBackgroundTask, progress =>
+          this.updatePushPullFetchProgress(repo, progress)
+        )
+      )
+      this.updatePushPullFetchProgress(repo, null)
+
+      return gitStore.aheadBehind
+    })
+  }
+
+  public _setRepositoryIndicatorsEnabled(repositoryIndicatorsEnabled: boolean) {
+    if (this.repositoryIndicatorsEnabled === repositoryIndicatorsEnabled) {
+      return
     }
 
-    lookup.set(repository.id, {
-      aheadBehind: gitStore.aheadBehind,
-      changedFilesCount: status.workingDirectory.files.length,
-    })
+    setBoolean(repositoryIndicatorsEnabledKey, repositoryIndicatorsEnabled)
+    this.repositoryIndicatorsEnabled = repositoryIndicatorsEnabled
+    if (repositoryIndicatorsEnabled) {
+      this.repositoryIndicatorUpdater.start()
+    } else {
+      this.repositoryIndicatorUpdater.stop()
+    }
+
+    this.emitUpdate()
   }
 
   /**
@@ -2773,12 +2936,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
       return
     }
 
-    if (currentPopup.type === PopupType.CloneRepository) {
-      this._completeOpenInDesktop(() => Promise.resolve(null))
-    }
-
     if (popupType !== undefined && currentPopup.type !== popupType) {
       return
+    }
+
+    if (currentPopup.type === PopupType.CloneRepository) {
+      this._completeOpenInDesktop(() => Promise.resolve(null))
     }
 
     this.currentPopup = null
@@ -2789,6 +2952,17 @@ export class AppStore extends TypedBaseStore<IAppState> {
   public async _showFoldout(foldout: Foldout): Promise<void> {
     this.currentFoldout = foldout
     this.emitUpdate()
+
+    // If the user is opening the repository list and we haven't yet
+    // started to refresh the repository indicators let's do so.
+    if (
+      foldout.type === FoldoutType.Repository &&
+      this.repositoryIndicatorsEnabled
+    ) {
+      // N.B: RepositoryIndicatorUpdater.prototype.start is
+      // idempotent.
+      this.repositoryIndicatorUpdater.start()
+    }
   }
 
   /** This shouldn't be called directly. See `Dispatcher`. */
@@ -2820,47 +2994,26 @@ export class AppStore extends TypedBaseStore<IAppState> {
     repository: Repository,
     name: string,
     startPoint: string | null,
-    uncommittedChangesStrategy: UncommittedChangesStrategy = askToStash
-  ): Promise<Repository> {
+    noTrackOption: boolean = false
+  ): Promise<void> {
     const gitStore = this.gitStoreCache.get(repository)
-    const branch = await gitStore.performFailableOperation(() =>
-      createBranch(repository, name, startPoint)
-    )
+    const branch = await gitStore.createBranch(name, startPoint, noTrackOption)
 
-    if (branch == null) {
-      return repository
+    if (branch !== undefined) {
+      await this._checkoutBranch(repository, branch)
     }
+  }
 
-    const { changesState, branchesState } = this.repositoryStateCache.get(
-      repository
-    )
-    const { tip } = branchesState
-    const currentBranch = tip.kind === TipState.Valid ? tip.branch : null
-    const hasChanges = changesState.workingDirectory.files.length > 0
+  /** This shouldn't be called directly. See `Dispatcher`. */
+  public async _createTag(repository: Repository, name: string, sha: string) {
+    const gitStore = this.gitStoreCache.get(repository)
+    await gitStore.createTag(name, sha)
+  }
 
-    if (
-      enableStashing() &&
-      hasChanges &&
-      currentBranch !== null &&
-      uncommittedChangesStrategy.kind ===
-        UncommittedChangesStrategyKind.AskForConfirmation
-    ) {
-      this._showPopup({
-        type: PopupType.StashAndSwitchBranch,
-        branchToCheckout: branch,
-        repository,
-      })
-
-      return repository
-    }
-
-    const repo = await this._checkoutBranch(
-      repository,
-      branch,
-      uncommittedChangesStrategy
-    )
-    this._closePopup()
-    return repo
+  /** This shouldn't be called directly. See `Dispatcher`. */
+  public async _deleteTag(repository: Repository, name: string) {
+    const gitStore = this.gitStoreCache.get(repository)
+    await gitStore.deleteTag(name)
   }
 
   private updateCheckoutProgress(
@@ -2871,264 +3024,304 @@ export class AppStore extends TypedBaseStore<IAppState> {
       checkoutProgress,
     }))
 
-    if (this.selectedRepository === repository) {
+    if (
+      this.selectedRepository instanceof Repository &&
+      this.selectedRepository.id === repository.id
+    ) {
       this.emitUpdate()
     }
   }
 
-  private getLocalBranch(
-    repository: Repository,
-    branch: string
-  ): Branch | null {
-    const gitStore = this.gitStoreCache.get(repository)
-    return (
-      gitStore.allBranches.find(b => b.nameWithoutRemote === branch) || null
-    )
-  }
-
-  /** This shouldn't be called directly. See `Dispatcher`. */
+  /**
+   * Checkout the given branch, using given stashing strategy or the default.
+   *
+   * When `explicitStrategy` is undefined we'll use the default strategy
+   * configurable by the user in preferences. Without an explicit strategy
+   * this method will take care of presenting the user with any necessary
+   * confirmation dialogs and choices depending on the state of their
+   * repository.
+   *
+   * When provided with an explicit strategy other than `AskForConfirmation`
+   * we assume the user has been informed of any risks of overwritten stashes
+   * and such. In other words the only consumers who should pass an explicit
+   * strategy are dialogs and other confirmation constructs where the user
+   * has made an explicit choice about how to proceed.
+   *
+   * Note: This shouldn't be called directly. See `Dispatcher`.
+   */
   public async _checkoutBranch(
     repository: Repository,
-    branch: Branch | string,
-    uncommittedChangesStrategy: UncommittedChangesStrategy = askToStash
+    branch: Branch,
+    explicitStrategy?: UncommittedChangesStrategy
   ): Promise<Repository> {
-    const gitStore = this.gitStoreCache.get(repository)
-    const kind = 'checkout'
-    const foundBranch =
-      typeof branch === 'string'
-        ? this.getLocalBranch(repository, branch)
-        : branch
+    const repositoryState = this.repositoryStateCache.get(repository)
+    const { changesState, branchesState } = repositoryState
+    const { currentBranchProtected, stashEntry } = changesState
+    const { tip } = branchesState
+    const hasChanges = changesState.workingDirectory.files.length > 0
 
-    if (foundBranch == null) {
+    // No point in checking out the currently checked out branch.
+    if (tip.kind === TipState.Valid && tip.branch.name === branch.name) {
       return repository
     }
 
-    const { changesState, branchesState } = this.repositoryStateCache.get(
-      repository
-    )
+    let strategy = explicitStrategy ?? this.uncommittedChangesStrategy
 
-    let stashToPop: IStashEntry | null = null
-    if (enableStashing()) {
-      const hasChanges = changesState.workingDirectory.files.length > 0
-      if (
-        hasChanges &&
-        uncommittedChangesStrategy.kind ===
-          UncommittedChangesStrategyKind.AskForConfirmation
-      ) {
-        this._showPopup({
-          type: PopupType.StashAndSwitchBranch,
-          branchToCheckout: foundBranch,
-          repository,
-        })
-        return repository
-      }
-
-      const { tip } = branchesState
-      const currentBranch = tip.kind === TipState.Valid ? tip.branch : null
-      if (
-        currentBranch !== null &&
-        uncommittedChangesStrategy.kind ===
-          UncommittedChangesStrategyKind.StashOnCurrentBranch
-      ) {
-        await this._createStashAndDropPreviousEntry(
-          repository,
-          currentBranch.name
-        )
-        this.statsStore.recordStashCreatedOnCurrentBranch()
-      } else if (
-        uncommittedChangesStrategy.kind ===
-        UncommittedChangesStrategyKind.MoveToNewBranch
-      ) {
-        const hasDeletedFiles = changesState.workingDirectory.files.some(
-          file => file.status.kind === AppFileStatusKind.Deleted
-        )
-        if (
-          hasDeletedFiles &&
-          uncommittedChangesStrategy.transientStashEntry === null
-        ) {
-          const stashCreated = await gitStore.performFailableOperation(() => {
-            return createDesktopStashEntry(repository, foundBranch.name)
-          })
-
-          if (stashCreated) {
-            stashToPop = await getLastDesktopStashEntryForBranch(
-              repository,
-              foundBranch.name
-            )
-          }
+    // The user hasn't been presented with an explicit choice
+    if (explicitStrategy === undefined) {
+      // Even if the user has chosen to "always stash on current branch" in
+      // preferences we still want to let them know changes might be lost
+      if (strategy === UncommittedChangesStrategy.StashOnCurrentBranch) {
+        if (hasChanges && stashEntry !== null) {
+          const type = PopupType.ConfirmOverwriteStash
+          this._showPopup({ type, repository, branchToCheckout: branch })
+          return repository
         }
       }
     }
 
-    const checkoutSucceeded =
-      (await this.withAuthenticatingUser(repository, (repository, account) =>
-        gitStore.performFailableOperation(
-          () =>
-            checkoutBranch(repository, account, foundBranch, progress => {
-              this.updateCheckoutProgress(repository, progress)
-            }),
-          {
-            repository,
-            retryAction: {
-              type: RetryActionType.Checkout,
-              repository,
-              branch,
-            },
-            gitContext: {
-              kind: 'checkout',
-              branchToCheckout: foundBranch.name,
-            },
-          }
-        )
-      )) !== undefined
+    // Always move changes to new branch if we're on a detached head, unborn
+    // branch, or a protected branch.
+    if (tip.kind !== TipState.Valid || currentBranchProtected) {
+      strategy = UncommittedChangesStrategy.MoveToNewBranch
+    }
 
-    if (
-      enableStashing() &&
-      uncommittedChangesStrategy.kind ===
-        UncommittedChangesStrategyKind.MoveToNewBranch &&
-      checkoutSucceeded
-    ) {
-      // We increment the metric after checkout succeeds to guard
-      // against double counting when an error occurs on checkout.
-      // When an error occurs, one of our error handlers will inspect
-      // it and make a call to `moveChangesToBranchAndCheckout` which will
-      // call this method again once the working directory has been cleared.
-      this.statsStore.recordChangesTakenToNewBranch()
-
-      stashToPop = stashToPop || uncommittedChangesStrategy.transientStashEntry
-      if (stashToPop !== null) {
-        const stashSha = stashToPop.stashSha
-        await gitStore.performFailableOperation(() => {
-          return popStashEntry(repository, stashSha)
-        })
+    if (strategy === UncommittedChangesStrategy.AskForConfirmation) {
+      if (hasChanges) {
+        const type = PopupType.StashAndSwitchBranch
+        this._showPopup({ type, branchToCheckout: branch, repository })
+        return repository
       }
     }
 
-    // Make sure changes or suggested next step are visible after branch checkout
-    this._selectWorkingDirectoryFiles(repository)
+    return this.withAuthenticatingUser(repository, (repository, account) => {
+      // We always want to end with refreshing the repository regardless of
+      // whether the checkout succeeded or not in order to present the most
+      // up-to-date information to the user.
+      return this.checkoutImplementation(repository, branch, account, strategy)
+        .then(() => this.onSuccessfulCheckout(repository, branch))
+        .catch(e => this.emitError(new CheckoutError(e, repository, branch)))
+        .then(() => this.refreshAfterCheckout(repository, branch))
+        .finally(() => this.updateCheckoutProgress(repository, null))
+    })
+  }
 
-    try {
-      this.updateCheckoutProgress(repository, {
-        kind,
-        title: __DARWIN__ ? 'Refreshing Repository' : 'Refreshing repository',
-        value: 1,
-        targetBranch: foundBranch.name,
-      })
+  /** Invoke the best checkout implementation for the selected strategy */
+  private checkoutImplementation(
+    repository: Repository,
+    branch: Branch,
+    account: IGitAccount | null,
+    strategy: UncommittedChangesStrategy
+  ) {
+    if (strategy === UncommittedChangesStrategy.StashOnCurrentBranch) {
+      return this.checkoutAndLeaveChanges(repository, branch, account)
+    } else if (strategy === UncommittedChangesStrategy.MoveToNewBranch) {
+      return this.checkoutAndBringChanges(repository, branch, account)
+    } else {
+      return this.checkoutIgnoringChanges(repository, branch, account)
+    }
+  }
 
-      await this._refreshRepository(repository)
-    } finally {
-      this.updateCheckoutProgress(repository, null)
-      this._initializeCompare(repository, {
-        kind: HistoryTabMode.History,
-      })
+  /** Checkout the given branch without taking local changes into account */
+  private async checkoutIgnoringChanges(
+    repository: Repository,
+    branch: Branch,
+    account: IGitAccount | null
+  ) {
+    await checkoutBranch(repository, account, branch, progress => {
+      this.updateCheckoutProgress(repository, progress)
+    })
+  }
+
+  /**
+   * Checkout the given branch and leave any local changes on the current branch
+   *
+   * Note that this will ovewrite any existing stash enty on the current branch.
+   */
+  private async checkoutAndLeaveChanges(
+    repository: Repository,
+    branch: Branch,
+    account: IGitAccount | null
+  ) {
+    const repositoryState = this.repositoryStateCache.get(repository)
+    const { workingDirectory } = repositoryState.changesState
+    const { tip } = repositoryState.branchesState
+
+    if (tip.kind === TipState.Valid && workingDirectory.files.length > 0) {
+      await this.createStashAndDropPreviousEntry(repository, tip.branch)
+      this.statsStore.recordStashCreatedOnCurrentBranch()
     }
 
-    const { defaultBranch } = branchesState
-    if (defaultBranch !== null && foundBranch.name !== defaultBranch.name) {
+    return this.checkoutIgnoringChanges(repository, branch, account)
+  }
+
+  /**
+   * Checkout the given branch and move any local changes along.
+   *
+   * Will attempt to simply check out the branch and if that fails due to
+   * local changes risking being overwritten it'll create a transient stash
+   * entry, switch branches, and pop said stash entry.
+   *
+   * Note that the transient stash entry will not overwrite any current stash
+   * entry for the target branch.
+   */
+  private async checkoutAndBringChanges(
+    repository: Repository,
+    branch: Branch,
+    account: IGitAccount | null
+  ) {
+    try {
+      await this.checkoutIgnoringChanges(repository, branch, account)
+    } catch (checkoutError) {
+      if (!isLocalChangesOverwrittenError(checkoutError)) {
+        throw checkoutError
+      }
+
+      const stash = (await this.createStashEntry(repository, branch))
+        ? await getLastDesktopStashEntryForBranch(repository, branch)
+        : null
+
+      // Failing to stash the changes when we know that there are changes
+      // preventing a checkout is very likely due to assume-unchanged or
+      // skip-worktree. So instead of showing a "could not create stash" error
+      // we'll show the checkout error to the user and let them figure it out.
+      if (stash === null) {
+        throw checkoutError
+      }
+
+      await this.checkoutIgnoringChanges(repository, branch, account)
+      await popStashEntry(repository, stash.stashSha)
+
+      this.statsStore.recordChangesTakenToNewBranch()
+    }
+  }
+
+  private async onSuccessfulCheckout(repository: Repository, branch: Branch) {
+    const repositoryState = this.repositoryStateCache.get(repository)
+    const { stashEntry } = repositoryState.changesState
+    const { defaultBranch } = repositoryState.branchesState
+
+    this.clearBranchProtectionState(repository)
+
+    // Make sure changes or suggested next step are visible after branch checkout
+    await this._selectWorkingDirectoryFiles(repository)
+
+    this._initializeCompare(repository, { kind: HistoryTabMode.History })
+
+    if (defaultBranch !== null && branch.name !== defaultBranch.name) {
       this.statsStore.recordNonDefaultBranchCheckout()
     }
 
-    if (changesState.stashEntry !== null && !this.hasUserViewedStash) {
+    if (stashEntry !== null && !this.hasUserViewedStash) {
       this.statsStore.recordStashNotViewedAfterCheckout()
     }
 
     this.hasUserViewedStash = false
+  }
 
+  private async refreshAfterCheckout(repository: Repository, branch: Branch) {
+    this.updateCheckoutProgress(repository, {
+      kind: 'checkout',
+      title: `Refreshing ${__DARWIN__ ? 'Repository' : 'repository'}`,
+      value: 1,
+      targetBranch: branch.name,
+    })
+
+    await this._refreshRepository(repository)
     return repository
   }
 
-  /** This shouldn't be called directly. See `Dispatcher`. */
+  /**
+   * Creates a stash associated to the current checked out branch.
+   *
+   * @param repository
+   * @param showConfirmationDialog  Whether to show a confirmation
+   *                                dialog if an existing stash exists.
+   */
+  public async _createStashForCurrentBranch(
+    repository: Repository,
+    showConfirmationDialog: boolean
+  ): Promise<boolean> {
+    const repositoryState = this.repositoryStateCache.get(repository)
+    const tip = repositoryState.branchesState.tip
+    const currentBranch = tip.kind === TipState.Valid ? tip.branch : null
+    const hasExistingStash = repositoryState.changesState.stashEntry !== null
+
+    if (currentBranch === null) {
+      return false
+    }
+
+    if (showConfirmationDialog && hasExistingStash) {
+      this._showPopup({
+        type: PopupType.ConfirmOverwriteStash,
+        branchToCheckout: null,
+        repository,
+      })
+      return false
+    }
+
+    if (await this.createStashAndDropPreviousEntry(repository, currentBranch)) {
+      this.statsStore.recordStashCreatedOnCurrentBranch()
+      await this._refreshRepository(repository)
+      return true
+    }
+
+    return false
+  }
+
+  /**
+   * refetches the associated GitHub remote repository, if possible
+   *
+   * if refetching fails, will return the given `repository` with
+   * the same info it was passed in with
+   *
+   * @param repository
+   * @returns repository model (hopefully with fresh `gitHubRepository` info)
+   */
   private async repositoryWithRefreshedGitHubRepository(
     repository: Repository
   ): Promise<Repository> {
-    const oldGitHubRepository = repository.gitHubRepository
+    const repoStore = this.repositoriesStore
+    const match = await this.matchGitHubRepository(repository)
 
-    const matchedGitHubRepository = await this.matchGitHubRepository(repository)
-    if (!matchedGitHubRepository) {
-      // TODO: We currently never clear GitHub repository associations (see
-      // https://github.com/desktop/desktop/issues/1144). So we can bail early
-      // at this point.
+    // TODO: We currently never clear GitHub repository associations (see
+    // https://github.com/desktop/desktop/issues/1144). So we can bail early at
+    // this point.
+    if (!match) {
       return repository
     }
 
-    // This is the repository with the GitHub repository as matched. It's not
-    // ideal because the GitHub repository hasn't been fetched from the API yet
-    // and so it is incomplete. But if we _can't_ fetch it from the API, it's
-    // better than nothing.
-    const skeletonOwner = new Owner(
-      matchedGitHubRepository.owner,
-      matchedGitHubRepository.endpoint,
-      null
-    )
-    const skeletonGitHubRepository = new GitHubRepository(
-      matchedGitHubRepository.name,
-      skeletonOwner,
-      null
-    )
-    const skeletonRepository = new Repository(
-      repository.path,
-      repository.id,
-      skeletonGitHubRepository,
-      repository.missing
-    )
-
-    const account = getAccountForEndpoint(
-      this.accounts,
-      matchedGitHubRepository.endpoint
-    )
-    if (!account) {
-      // If the repository given to us had a GitHubRepository instance we want
-      // to try to preserve that if possible since the updated GitHubRepository
-      // instance won't have any API information while the previous one might.
-      // We'll only swap it out if the endpoint has changed in which case the
-      // old API information will be invalid anyway.
-      if (
-        !oldGitHubRepository ||
-        matchedGitHubRepository.endpoint !== oldGitHubRepository.endpoint
-      ) {
-        return skeletonRepository
-      }
-
-      return repository
-    }
-
-    const { owner, name } = matchedGitHubRepository
-
+    const { account, owner, name } = match
+    const { endpoint } = account
     const api = API.fromAccount(account)
     const apiRepo = await api.fetchRepository(owner, name)
 
-    if (!apiRepo) {
-      // This is the same as above. If the request fails, we wanna preserve the
-      // existing GitHub repository info. But if we didn't have a GitHub
-      // repository already or the endpoint changed, the skeleton repository is
-      // better than nothing.
-      if (
-        !oldGitHubRepository ||
-        matchedGitHubRepository.endpoint !== oldGitHubRepository.endpoint
-      ) {
-        return skeletonRepository
+    if (apiRepo === null) {
+      // If the request fails, we want to preserve the existing GitHub
+      // repository info. But if we didn't have a GitHub repository already or
+      // the endpoint changed, the skeleton repository is better than nothing.
+      if (endpoint !== repository.gitHubRepository?.endpoint) {
+        const ghRepo = await repoStore.upsertGitHubRepositoryFromMatch(match)
+        return repoStore.setGitHubRepository(repository, ghRepo)
       }
 
       return repository
     }
 
-    const endpoint = matchedGitHubRepository.endpoint
-    const updatedRepository = await this.repositoriesStore.updateGitHubRepository(
-      repository,
-      endpoint,
-      apiRepo
-    )
+    if (enableUpdateRemoteUrl() && repository.gitHubRepository) {
+      const gitStore = this.gitStoreCache.get(repository)
+      await updateRemoteUrl(gitStore, repository.gitHubRepository, apiRepo)
+    }
 
-    await this.updateBranchProtectionsFromAPI(repository)
+    const ghRepo = await repoStore.upsertGitHubRepository(endpoint, apiRepo)
+    const freshRepo = await repoStore.setGitHubRepository(repository, ghRepo)
 
-    return updatedRepository
+    await this.refreshBranchProtectionState(freshRepo)
+    return freshRepo
   }
 
   private async updateBranchProtectionsFromAPI(repository: Repository) {
-    if (
-      repository.gitHubRepository === null ||
-      repository.gitHubRepository.dbID === null
-    ) {
+    if (repository.gitHubRepository === null) {
       return
     }
 
@@ -3145,9 +3338,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
     const api = API.fromAccount(account)
 
-    const branches = enableBranchProtectionChecks()
-      ? await api.fetchProtectedBranches(owner.login, name)
-      : new Array<IAPIBranch>()
+    const branches = await api.fetchProtectedBranches(owner.login, name)
 
     await this.repositoriesStore.updateBranchProtections(
       repository.gitHubRepository,
@@ -3159,6 +3350,11 @@ export class AppStore extends TypedBaseStore<IAppState> {
     repository: Repository
   ): Promise<IMatchedGitHubRepository | null> {
     const gitStore = this.gitStoreCache.get(repository)
+
+    if (!gitStore.defaultRemote) {
+      await gitStore.loadRemotes()
+    }
+
     const remote = gitStore.defaultRemote
     return remote !== null
       ? matchGitHubRepository(this.accounts, remote.url)
@@ -3205,18 +3401,33 @@ export class AppStore extends TypedBaseStore<IAppState> {
   ): Promise<void> {
     return this.withAuthenticatingUser(repository, async (r, account) => {
       const { branchesState } = this.repositoryStateCache.get(r)
-      const { defaultBranch } = branchesState
+      let branchToCheckout = branchesState.defaultBranch
 
-      if (defaultBranch == null) {
+      // If the default branch is null, use the most recent branch excluding the branch
+      // the branch to delete as the branch to checkout.
+      if (branchToCheckout === null) {
+        let i = 0
+
+        while (i < branchesState.recentBranches.length) {
+          if (branchesState.recentBranches[i].name !== branch.name) {
+            branchToCheckout = branchesState.recentBranches[i]
+            break
+          }
+          i++
+        }
+      }
+
+      if (branchToCheckout === null) {
         throw new Error(
-          `A default branch cannot be found for this repository, so the app is unable to identify which branch to switch to before removing the current branch.`
+          `It's not possible to delete the only existing branch in a repository.`
         )
       }
 
+      const nonNullBranchToCheckout = branchToCheckout
       const gitStore = this.gitStoreCache.get(r)
 
       await gitStore.performFailableOperation(() =>
-        checkoutBranch(r, account, defaultBranch)
+        checkoutBranch(r, account, nonNullBranchToCheckout)
       )
       await gitStore.performFailableOperation(() =>
         deleteBranch(r, branch, account, includeRemote)
@@ -3233,7 +3444,13 @@ export class AppStore extends TypedBaseStore<IAppState> {
     this.repositoryStateCache.update(repository, () => ({
       pushPullFetchProgress,
     }))
-
+    if (enableProgressBarOnIcon()) {
+      if (pushPullFetchProgress !== null) {
+        remote.getCurrentWindow().setProgressBar(pushPullFetchProgress.value)
+      } else {
+        remote.getCurrentWindow().setProgressBar(-1)
+      }
+    }
     if (this.selectedRepository === repository) {
       this.emitUpdate()
     }
@@ -3311,15 +3528,54 @@ export class AppStore extends TypedBaseStore<IAppState> {
           repository,
         }
 
+        // This is most likely not necessary and is only here out of
+        // an abundance of caution. We're introducing support for
+        // automatically configuring Git proxies based on system
+        // proxy settings and therefore need to pass along the remote
+        // url to functions such as push, pull, fetch etc.
+        //
+        // Prior to this we relied primarily on the `branch.remote`
+        // property and used the `remote.name` as a fallback in case the
+        // branch object didn't have a remote name (i.e. if it's not
+        // published yet).
+        //
+        // The remote.name is derived from the current tip first and falls
+        // back to using the defaultRemote if the current tip isn't valid
+        // or if the current branch isn't published. There's however no
+        // guarantee that they'll be refreshed at the exact same time so
+        // there's a theoretical possibility that `branch.remote` and
+        // `remote.name` could be out of sync. I have no reason to suspect
+        // that's the case and if it is then we already have problems as
+        // the `fetchRemotes` call after the push already relies on the
+        // `remote` and not the `branch.remote`. All that said this is
+        // a critical path in the app and somehow breaking pushing would
+        // be near unforgivable so I'm introducing this `safeRemote`
+        // temporarily to ensure that there's no risk of us using an
+        // out of sync remote name while still providing envForRemoteOperation
+        // with an url to use when resolving proxies.
+        //
+        // I'm also adding a non fatal exception if this ever happens
+        // so that we can confidently remove this safeguard in a future
+        // release.
+        const safeRemote: IRemote = { name: remoteName, url: remote.url }
+
+        if (safeRemote.name !== remote.name) {
+          sendNonFatalException(
+            'remoteNameMismatch',
+            new Error('The current remote name differs from the branch remote')
+          )
+        }
+
         const gitStore = this.gitStoreCache.get(repository)
         await gitStore.performFailableOperation(
           async () => {
             await pushRepo(
               repository,
               account,
-              remoteName,
+              safeRemote,
               branch.name,
               branch.upstreamWithoutRemote,
+              gitStore.tagsToPush,
               options,
               progress => {
                 this.updatePushPullFetchProgress(repository, {
@@ -3329,10 +3585,11 @@ export class AppStore extends TypedBaseStore<IAppState> {
                 })
               }
             )
+            gitStore.clearTagsToPush()
 
             await gitStore.fetchRemotes(
               account,
-              [remote],
+              [safeRemote],
               false,
               fetchProgress => {
                 this.updatePushPullFetchProgress(repository, {
@@ -3355,7 +3612,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
             // manually refresh branch protections after the push, to ensure
             // any new branch will immediately report as protected
-            await this.updateBranchProtectionsFromAPI(repository)
+            await this.refreshBranchProtectionState(repository)
 
             await this._refreshRepository(repository)
 
@@ -3375,13 +3632,14 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
         this.updateMenuLabelsForSelectedRepository()
 
-        const { accounts } = this.getState()
-        const githubAccount = await findAccountForRemoteURL(
-          remote.url,
-          accounts
+        // Note that we're using `getAccountForRepository` here instead
+        // of the `account` instance we've got and that's because recordPush
+        // needs to be able to differentiate between a GHES account and a
+        // generic account and it can't do that only based on the endpoint.
+        this.statsStore.recordPush(
+          getAccountForRepository(this.accounts, repository),
+          options
         )
-
-        this.statsStore.recordPush(githubAccount, options)
       }
     })
   }
@@ -3522,7 +3780,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
           await gitStore.performFailableOperation(
             () =>
-              pullRepo(repository, account, remote.name, progress => {
+              pullRepo(repository, account, remote, progress => {
                 this.updatePushPullFetchProgress(repository, {
                   ...progress,
                   value: progress.value * pullWeight,
@@ -3551,7 +3809,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
           // manually refresh branch protections after the push, to ensure
           // any new branch will immediately report as protected
-          await this.updateBranchProtectionsFromAPI(repository)
+          await this.refreshBranchProtectionState(repository)
 
           await this._refreshRepository(repository)
 
@@ -3571,31 +3829,9 @@ export class AppStore extends TypedBaseStore<IAppState> {
   }
 
   private async fastForwardBranches(repository: Repository) {
-    const state = this.repositoryStateCache.get(repository)
-    const branches = state.branchesState.allBranches
+    const { branchesState } = this.repositoryStateCache.get(repository)
 
-    const tip = state.branchesState.tip
-    const currentBranchName =
-      tip.kind === TipState.Valid ? tip.branch.name : null
-
-    let eligibleBranches = branches.filter(b =>
-      eligibleForFastForward(b, currentBranchName)
-    )
-
-    if (eligibleBranches.length >= FastForwardBranchesThreshold) {
-      log.info(
-        `skipping fast-forward for all branches as there are ${
-          eligibleBranches.length
-        } local branches - this will run again when there are less than ${FastForwardBranchesThreshold} local branches tracking remotes`
-      )
-
-      const defaultBranch = state.branchesState.defaultBranch
-      eligibleBranches =
-        defaultBranch != null &&
-        eligibleForFastForward(defaultBranch, currentBranchName)
-          ? [defaultBranch]
-          : []
-    }
+    const eligibleBranches = findBranchesForFastForward(branchesState)
 
     for (const branch of eligibleBranches) {
       const aheadBehind = await getBranchAheadBehind(repository, branch)
@@ -3656,22 +3892,14 @@ export class AppStore extends TypedBaseStore<IAppState> {
   }
 
   private getAccountForRemoteURL(remote: string): IGitAccount | null {
-    const gitHubRepository = matchGitHubRepository(this.accounts, remote)
-    if (gitHubRepository) {
-      const account = getAccountForEndpoint(
-        this.accounts,
-        gitHubRepository.endpoint
+    const account = matchGitHubRepository(this.accounts, remote)?.account
+    if (account !== undefined) {
+      const hasValidToken =
+        account.token.length > 0 ? 'has token' : 'empty token'
+      log.info(
+        `[AppStore.getAccountForRemoteURL] account found for remote: ${remote} - ${account.login} (${hasValidToken})`
       )
-      if (account) {
-        const hasValidToken =
-          account.token.length > 0 ? 'has token' : 'empty token'
-        log.info(
-          `[AppStore.getAccountForRemoteURL] account found for remote: ${remote} - ${
-            account.login
-          } (${hasValidToken})`
-        )
-        return account
-      }
+      return account
     }
 
     const hostname = getGenericHostname(remote)
@@ -3727,6 +3955,18 @@ export class AppStore extends TypedBaseStore<IAppState> {
   ) {
     const gitStore = this.gitStoreCache.get(repository)
     await gitStore.discardChanges(files)
+
+    return this._refreshRepository(repository)
+  }
+
+  public async _discardChangesFromSelection(
+    repository: Repository,
+    filePath: string,
+    diff: ITextDiff,
+    selection: DiffSelection
+  ) {
+    const gitStore = this.gitStoreCache.get(repository)
+    await gitStore.discardChangesFromSelection(filePath, diff, selection)
 
     return this._refreshRepository(repository)
   }
@@ -3853,7 +4093,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
         // manually refresh branch protections after the push, to ensure
         // any new branch will immediately report as protected
-        await this.updateBranchProtectionsFromAPI(repository)
+        await this.refreshBranchProtectionState(repository)
 
         await this._refreshRepository(repository)
 
@@ -3979,7 +4219,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
   public async _mergeBranch(
     repository: Repository,
     branch: string,
-    mergeStatus: MergeResult | null
+    mergeStatus: MergeTreeResult | null
   ): Promise<void> {
     const gitStore = this.gitStoreCache.get(repository)
 
@@ -3993,12 +4233,21 @@ export class AppStore extends TypedBaseStore<IAppState> {
       }
     }
 
-    const mergeSuccessful = await gitStore.merge(branch)
+    const mergeResult = await gitStore.merge(branch)
     const { tip } = gitStore
 
-    if (mergeSuccessful && tip.kind === TipState.Valid) {
+    if (mergeResult === MergeResult.Success && tip.kind === TipState.Valid) {
       this._setBanner({
         type: BannerType.SuccessfulMerge,
+        ourBranch: tip.branch.name,
+        theirBranch: branch,
+      })
+    } else if (
+      mergeResult === MergeResult.AlreadyUpToDate &&
+      tip.kind === TipState.Valid
+    ) {
+      this._setBanner({
+        type: BannerType.BranchAlreadyUpToDate,
         ourBranch: tip.branch.name,
         theirBranch: branch,
       })
@@ -4072,7 +4321,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       // this timeout is intended to defer the action from running immediately
       // after the progress UI is shown, to better show that rebase is
       // progressing rather than suddenly appearing and disappearing again
-      await timeout(500)
+      await sleep(500)
       await step.rebaseAction()
     }
   }
@@ -4105,8 +4354,16 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
 
     const gitStore = this.gitStoreCache.get(repository)
-    const result = await gitStore.performFailableOperation(() =>
-      rebase(repository, baseBranch, targetBranch, progressCallback)
+    const result = await gitStore.performFailableOperation(
+      () => rebase(repository, baseBranch, targetBranch, progressCallback),
+      {
+        retryAction: {
+          type: RetryActionType.Rebase,
+          repository,
+          baseBranch,
+          targetBranch,
+        },
+      }
     )
 
     return result || RebaseResult.Error
@@ -4160,7 +4417,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
   public async _finishConflictedMerge(
     repository: Repository,
     workingDirectory: WorkingDirectoryStatus,
-    manualResolutions: Map<string, ManualConflictResolutionKind>
+    manualResolutions: Map<string, ManualConflictResolution>
   ): Promise<string | undefined> {
     /**
      *  The assumption made here is that all other files that were part of this merge
@@ -4187,13 +4444,13 @@ export class AppStore extends TypedBaseStore<IAppState> {
   }
 
   /** This shouldn't be called directly. See `Dispatcher`. */
-  public _setRemoteURL(
+  public async _setRemoteURL(
     repository: Repository,
     name: string,
     url: string
   ): Promise<void> {
     const gitStore = this.gitStoreCache.get(repository)
-    return gitStore.setRemoteURL(name, url)
+    await gitStore.setRemoteURL(name, url)
   }
 
   /** This shouldn't be called directly. See `Dispatcher`. */
@@ -4291,14 +4548,24 @@ export class AppStore extends TypedBaseStore<IAppState> {
     return Promise.resolve()
   }
 
-  public _setExternalEditor(selectedEditor: ExternalEditor): Promise<void> {
-    this.selectedExternalEditor = selectedEditor
+  public _setUncommittedChangesStrategySetting(
+    value: UncommittedChangesStrategy
+  ): Promise<void> {
+    this.uncommittedChangesStrategy = value
+
+    localStorage.setItem(uncommittedChangesStrategyKey, value)
+
+    this.emitUpdate()
+    return Promise.resolve()
+  }
+
+  public _setExternalEditor(selectedEditor: ExternalEditor) {
+    const promise = this.updateSelectedExternalEditor(selectedEditor)
     localStorage.setItem(externalEditorKey, selectedEditor)
     this.emitUpdate()
 
     this.updateMenuLabelsForSelectedRepository()
-
-    return Promise.resolve()
+    return promise
   }
 
   public _setShell(shell: Shell): Promise<void> {
@@ -4334,6 +4601,15 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
   }
 
+  public _setShowSideBySideDiff(showSideBySideDiff: boolean) {
+    if (showSideBySideDiff !== this.showSideBySideDiff) {
+      setShowSideBySideDiff(showSideBySideDiff)
+      this.showSideBySideDiff = showSideBySideDiff
+      this.statsStore.recordDiffModeChanged()
+      this.emitUpdate()
+    }
+  }
+
   public _setUpdateBannerVisibility(visibility: boolean) {
     this.isUpdateAvailableBannerVisible = visibility
 
@@ -4358,26 +4634,6 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
     this.currentBanner = null
     this.emitUpdate()
-  }
-
-  public _setDivergingBranchBannerVisibility(
-    repository: Repository,
-    visible: boolean
-  ) {
-    const state = this.repositoryStateCache.get(repository)
-    const { compareState } = state
-
-    if (compareState.isDivergingBranchBannerVisible !== visible) {
-      this.repositoryStateCache.updateCompareState(repository, () => ({
-        isDivergingBranchBannerVisible: visible,
-      }))
-
-      if (visible) {
-        this.statsStore.recordDivergingBranchBannerDisplayed()
-      }
-
-      this.emitUpdate()
-    }
   }
 
   public _reportStats() {
@@ -4443,10 +4699,16 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
 
     if (this.appIsFocused) {
+      this.repositoryIndicatorUpdater.resume()
       if (this.selectedRepository instanceof Repository) {
         this.startPullRequestUpdater(this.selectedRepository)
+        // if we're in the tutorial and we don't have an editor yet, check for one!
+        if (this.currentOnboardingTutorialStep === TutorialStep.PickEditor) {
+          await this._resolveCurrentEditor()
+        }
       }
     } else {
+      this.repositoryIndicatorUpdater.pause()
       this.stopPullRequestUpdater()
     }
   }
@@ -4491,29 +4753,16 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
   public _removeAccount(account: Account): Promise<void> {
     log.info(
-      `[AppStore] removing account ${account.login} (${
-        account.name
-      }) from store`
+      `[AppStore] removing account ${account.login} (${account.name}) from store`
     )
     return this.accountsStore.removeAccount(account)
   }
 
-  public async _addAccount(account: Account): Promise<void> {
+  private async _addAccount(account: Account): Promise<void> {
     log.info(
       `[AppStore] adding account ${account.login} (${account.name}) to store`
     )
     const storedAccount = await this.accountsStore.addAccount(account)
-    const selectedState = this.getState().selectedState
-
-    if (selectedState && selectedState.type === SelectionType.Repository) {
-      // ensuring we have the latest set of accounts here, rather than waiting
-      // and doing stuff when the account store emits an update and we refresh
-      // the accounts field
-      const accounts = await this.accountsStore.getAll()
-      const repoState = selectedState.state
-      const commits = repoState.commitLookup.values()
-      this.loadAndCacheUsers(selectedState.repository, accounts, commits)
-    }
 
     // If we're in the welcome flow and a user signs in we want to trigger
     // a refresh of the repositories available for cloning straight away
@@ -4524,21 +4773,6 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
   }
 
-  private loadAndCacheUsers(
-    repository: Repository,
-    accounts: ReadonlyArray<Account>,
-    commits: Iterable<Commit>
-  ) {
-    for (const commit of commits) {
-      this.gitHubUserStore._loadAndCacheUser(
-        accounts,
-        repository,
-        commit.sha,
-        commit.author.email
-      )
-    }
-  }
-
   public _updateRepositoryMissing(
     repository: Repository,
     missing: boolean
@@ -4546,15 +4780,72 @@ export class AppStore extends TypedBaseStore<IAppState> {
     return this.repositoriesStore.updateRepositoryMissing(repository, missing)
   }
 
+  /** This shouldn't be called directly. See `Dispatcher`. */
+  public async _updateRepositoryWorkflowPreferences(
+    repository: Repository,
+    workflowPreferences: WorkflowPreferences
+  ): Promise<void> {
+    await this.repositoriesStore.updateRepositoryWorkflowPreferences(
+      repository,
+      workflowPreferences
+    )
+  }
+
+  /**
+   * Add a tutorial repository.
+   *
+   * This method differs from the `_addRepositories` method in that it
+   * requires that the repository has been created on the remote and
+   * set up to track it. Given that tutorial repositories are created
+   * from the no-repositories blank slate it shouldn't be possible for
+   * another repository with the same path to exist in the repositories
+   * table but in case that hangs in the future this method will set
+   * the tutorial flag on the existing repository at the given path.
+   */
+  public async _addTutorialRepository(
+    path: string,
+    endpoint: string,
+    apiRepository: IAPIFullRepository
+  ) {
+    const validatedPath = await validatedRepositoryPath(path)
+    if (validatedPath) {
+      log.info(
+        `[AppStore] adding tutorial repository at ${validatedPath} to store`
+      )
+
+      await this.repositoriesStore.addTutorialRepository(
+        validatedPath,
+        endpoint,
+        apiRepository
+      )
+      this.tutorialAssessor.onNewTutorialRepository()
+    } else {
+      const error = new Error(`${path} isn't a git repository.`)
+      this.emitError(error)
+    }
+  }
+
   public async _addRepositories(
     paths: ReadonlyArray<string>
   ): Promise<ReadonlyArray<Repository>> {
     const addedRepositories = new Array<Repository>()
     const lfsRepositories = new Array<Repository>()
+    const invalidPaths = new Array<string>()
+
     for (const path of paths) {
       const validatedPath = await validatedRepositoryPath(path)
       if (validatedPath) {
         log.info(`[AppStore] adding repository at ${validatedPath} to store`)
+
+        const repositories = this.repositories
+        const existing = matchExistingRepository(repositories, validatedPath)
+
+        // We don't have to worry about repositoryWithRefreshedGitHubRepository
+        // and isUsingLFS if the repo already exists in the app.
+        if (existing !== undefined) {
+          addedRepositories.push(existing)
+          continue
+        }
 
         const addedRepo = await this.repositoriesStore.addRepository(
           validatedPath
@@ -4575,9 +4866,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
           lfsRepositories.push(refreshedRepo)
         }
       } else {
-        const error = new Error(`${path} isn't a git repository.`)
-        this.emitError(error)
+        invalidPaths.push(path)
       }
+    }
+
+    if (invalidPaths.length > 0) {
+      this.emitError(new Error(this.getInvalidRepoPathsMessage(invalidPaths)))
     }
 
     if (lfsRepositories.length > 0) {
@@ -4590,22 +4884,32 @@ export class AppStore extends TypedBaseStore<IAppState> {
     return addedRepositories
   }
 
-  public async _removeRepositories(
-    repositories: ReadonlyArray<Repository | CloningRepository>
+  public async _removeRepository(
+    repository: Repository | CloningRepository,
+    moveToTrash: boolean
   ): Promise<void> {
-    const localRepositories = repositories.filter(
-      r => r instanceof Repository
-    ) as ReadonlyArray<Repository>
-    const cloningRepositories = repositories.filter(
-      r => r instanceof CloningRepository
-    ) as ReadonlyArray<CloningRepository>
-    cloningRepositories.forEach(r => {
-      this._removeCloningRepository(r)
-    })
+    try {
+      if (moveToTrash) {
+        const deleted = shell.moveItemToTrash(repository.path)
 
-    const repositoryIDs = localRepositories.map(r => r.id)
-    for (const id of repositoryIDs) {
-      await this.repositoriesStore.removeRepository(id)
+        if (!deleted) {
+          this.emitError(
+            new Error(
+              `Failed moving repository directory to ${TrashNameLabel}.\n\nA common reason for this is if a file or directory is open in another program.`
+            )
+          )
+          return
+        }
+      }
+
+      if (repository instanceof CloningRepository) {
+        this._removeCloningRepository(repository)
+      } else {
+        await this.repositoriesStore.removeRepository(repository)
+      }
+    } catch (err) {
+      this.emitError(err)
+      return
     }
 
     const allRepositories = await this.repositoriesStore.getAll()
@@ -4634,6 +4938,23 @@ export class AppStore extends TypedBaseStore<IAppState> {
       )
       await this._selectRepository(updatedRepository)
     }
+  }
+
+  private getInvalidRepoPathsMessage(
+    invalidPaths: ReadonlyArray<string>
+  ): string {
+    if (invalidPaths.length === 1) {
+      return `${invalidPaths} isn't a Git repository.`
+    }
+
+    return `The following paths aren't Git repositories:\n\n${invalidPaths
+      .slice(0, MaxInvalidFoldersToDisplay)
+      .map(path => `- ${path}`)
+      .join('\n')}${
+      invalidPaths.length > MaxInvalidFoldersToDisplay
+        ? `\n\n(and ${invalidPaths.length - MaxInvalidFoldersToDisplay} more)`
+        : ''
+    }`
   }
 
   private async withAuthenticatingUser<T>(
@@ -4673,9 +4994,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       const hasValidToken =
         account.token.length > 0 ? 'has token' : 'empty token'
       log.info(
-        `[AppStore.withAuthenticatingUser] account found for repository: ${
-          repository.name
-        } - ${account.login} (${hasValidToken})`
+        `[AppStore.withAuthenticatingUser] account found for repository: ${repository.name} - ${account.login} (${hasValidToken})`
       )
     }
 
@@ -4784,17 +5103,24 @@ export class AppStore extends TypedBaseStore<IAppState> {
     return this.apiRepositoriesStore.loadRepositories(account)
   }
 
-  public _openMergeTool(repository: Repository, path: string): Promise<void> {
-    const gitStore = this.gitStoreCache.get(repository)
-    return gitStore.openMergeTool(path)
-  }
-
   public _changeBranchesTab(tab: BranchesTab): Promise<void> {
     this.selectedBranchesTab = tab
 
     this.emitUpdate()
 
     return Promise.resolve()
+  }
+
+  public async _showGitHubExplore(repository: Repository): Promise<void> {
+    const { gitHubRepository } = repository
+    if (!gitHubRepository || gitHubRepository.htmlURL === null) {
+      return
+    }
+
+    const url = new URL(gitHubRepository.htmlURL)
+    url.pathname = '/explore'
+
+    await this._openInBrowser(url.toString())
   }
 
   public async _createPullRequest(repository: Repository): Promise<void> {
@@ -4832,54 +5158,44 @@ export class AppStore extends TypedBaseStore<IAppState> {
   }
 
   public async _showPullRequest(repository: Repository): Promise<void> {
-    const gitHubRepository = repository.gitHubRepository
-
-    if (!gitHubRepository) {
+    // no pull requests from non github repos
+    if (repository.gitHubRepository === null) {
       return
     }
 
-    const state = this.repositoryStateCache.get(repository)
-    const currentPullRequest = state.branchesState.currentPullRequest
+    const currentPullRequest = this.repositoryStateCache.get(repository)
+      .branchesState.currentPullRequest
 
-    if (!currentPullRequest) {
+    if (currentPullRequest === null) {
+      return
+    }
+    const { htmlURL: baseRepoUrl } = currentPullRequest.base.gitHubRepository
+
+    if (baseRepoUrl === null) {
       return
     }
 
-    const baseURL = `${gitHubRepository.htmlURL}/pull/${
-      currentPullRequest.pullRequestNumber
-    }`
+    const showPrUrl = `${baseRepoUrl}/pull/${currentPullRequest.pullRequestNumber}`
 
-    await this._openInBrowser(baseURL)
+    await this._openInBrowser(showPrUrl)
   }
 
   public async _refreshPullRequests(repository: Repository): Promise<void> {
-    const account = getAccountForRepository(this.accounts, repository)
-    const { gitHubRepository } = repository
-
-    if (gitHubRepository === null || account === null) {
-      return
+    if (isRepositoryWithGitHubRepository(repository)) {
+      const account = getAccountForRepository(this.accounts, repository)
+      if (account !== null) {
+        await this.pullRequestCoordinator.refreshPullRequests(
+          repository,
+          account
+        )
+      }
     }
-
-    await this.pullRequestStore.refreshPullRequests(gitHubRepository, account)
-  }
-
-  private findRepositoryByGitHubRepository(gitHubRepository: GitHubRepository) {
-    return this.repositories.find(
-      r =>
-        r.gitHubRepository !== null &&
-        r.gitHubRepository.dbID === gitHubRepository.dbID
-    )
   }
 
   private async onPullRequestChanged(
-    gitHubRepository: GitHubRepository,
+    repository: Repository,
     openPullRequests: ReadonlyArray<PullRequest>
   ) {
-    const repository = this.findRepositoryByGitHubRepository(gitHubRepository)
-    if (!repository) {
-      return
-    }
-
     this.repositoryStateCache.updateBranchesState(repository, () => {
       return { openPullRequests }
     })
@@ -4935,11 +5251,13 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
 
     const urlEncodedBranchName = escape(branch.nameWithoutRemote)
-    const baseURL = `${
-      gitHubRepository.htmlURL
-    }/pull/new/${urlEncodedBranchName}`
+    const baseURL = `${gitHubRepository.htmlURL}/pull/new/${urlEncodedBranchName}`
 
     await this._openInBrowser(baseURL)
+
+    if (this.currentOnboardingTutorialStep === TutorialStep.OpenPullRequest) {
+      this._markPullRequestTutorialStepAsComplete(repository)
+    }
   }
 
   public async _updateExistingUpstreamRemote(
@@ -4980,81 +5298,87 @@ export class AppStore extends TypedBaseStore<IAppState> {
   }
 
   public async _checkoutPullRequest(
-    repository: Repository,
-    pullRequest: PullRequest
+    repository: RepositoryWithGitHubRepository,
+    prNumber: number,
+    headRepoOwner: string,
+    headCloneUrl: string,
+    headRefName: string
   ): Promise<void> {
-    const gitHubRepository = forceUnwrap(
-      `Cannot checkout a PR if the repository doesn't have a GitHub repository`,
-      repository.gitHubRepository
+    const gitStore = this.gitStoreCache.get(repository)
+    const remotes = await getRemotes(repository)
+
+    // Find an existing remote (regardless if set up by us or outside of
+    // Desktop).
+    let remote = remotes.find(r => urlMatchesRemote(headCloneUrl, r))
+
+    // If we can't find one we'll create a Desktop fork remote.
+    if (remote === undefined) {
+      try {
+        const forkRemoteName = forkPullRequestRemoteName(headRepoOwner)
+        remote = await addRemote(repository, forkRemoteName, headCloneUrl)
+      } catch (e) {
+        this.emitError(
+          new Error(`Couldn't checkout PR, adding remote failed: ${e.message}`)
+        )
+        return
+      }
+    }
+
+    const remoteRef = `${remote.name}/${headRefName}`
+
+    // Start by trying to find a local branch that is tracking the remote ref.
+    let existingBranch = gitStore.allBranches.find(
+      x => x.type === BranchType.Local && x.upstream === remoteRef
     )
-    const head = pullRequest.head
-    const isRefInThisRepo =
-      head.gitHubRepository.cloneURL === gitHubRepository.cloneURL
 
-    if (isRefInThisRepo) {
-      const gitStore = this.gitStoreCache.get(repository)
-      const defaultRemote = gitStore.defaultRemote
-      // if we don't have a default remote here, it's probably going
-      // to just crash and burn on checkout, but that's okay
-      if (defaultRemote != null) {
-        // the remote ref will be something like `origin/my-cool-branch`
-        const remoteRef = `${defaultRemote.name}/${head.ref}`
+    // If we found one, let's check it out and get out of here, quick
+    if (existingBranch !== undefined) {
+      await this._checkoutBranch(repository, existingBranch)
+      this.statsStore.recordPRBranchCheckout()
+      return
+    }
 
-        const remoteRefExists =
-          gitStore.allBranches.find(branch => branch.name === remoteRef) != null
+    const findRemoteBranch = (name: string) =>
+      gitStore.allBranches.find(
+        x => x.type === BranchType.Remote && x.name === name
+      )
 
-        // only try a fetch here if we can't find the ref
-        if (!remoteRefExists) {
-          await this._fetchRemote(
-            repository,
-            defaultRemote,
-            FetchType.UserInitiatedTask
-          )
-        }
+    // No such luck, let's see if we can at least find the remote branch then
+    existingBranch = findRemoteBranch(remoteRef)
+
+    // If quite possible that the PR was created after our last fetch of the
+    // remote so let's fetch it and then try again.
+    if (existingBranch === undefined) {
+      try {
+        await this._fetchRemote(repository, remote, FetchType.UserInitiatedTask)
+        existingBranch = findRemoteBranch(remoteRef)
+      } catch (e) {
+        log.error(`Failed fetching remote ${remote?.name}`, e)
       }
-      await this._checkoutBranch(repository, head.ref)
+    }
+
+    if (existingBranch === undefined) {
+      this.emitError(
+        new Error(
+          `Couldn't find branch '${headRefName}' in remote '${remote.name}'. ` +
+            `A common cause for this is if the PR author has deleted their ` +
+            `branch or their forked repository.`
+        )
+      )
+      return
+    }
+
+    // For fork remotes we checkout the ref as pr/[123] instead of using the
+    // head ref name since many PRs from forks are created from their default
+    // branch so we'll have a very high likelihood of a conflicting local branch
+    const isForkRemote =
+      remote.name !== gitStore.defaultRemote?.name &&
+      remote.name !== gitStore.upstreamRemote?.name
+
+    if (isForkRemote) {
+      await this._createBranch(repository, `pr/${prNumber}`, remoteRef)
     } else {
-      const cloneURL = forceUnwrap(
-        "This pull request's clone URL is not populated but should be",
-        head.gitHubRepository.cloneURL
-      )
-      const remoteName = forkPullRequestRemoteName(
-        head.gitHubRepository.owner.login
-      )
-      const remotes = await getRemotes(repository)
-      const remote =
-        remotes.find(r => r.name === remoteName) ||
-        (await addRemote(repository, remoteName, cloneURL))
-
-      if (remote.url !== cloneURL) {
-        const error = new Error(
-          `Expected PR remote ${remoteName} url to be ${cloneURL} got ${
-            remote.url
-          }.`
-        )
-
-        log.error(error.message)
-        return this.emitError(error)
-      }
-
-      await this._fetchRemote(repository, remote, FetchType.UserInitiatedTask)
-
-      const gitStore = this.gitStoreCache.get(repository)
-
-      const localBranchName = `pr/${pullRequest.pullRequestNumber}`
-      const doesBranchExist =
-        gitStore.allBranches.find(branch => branch.name === localBranchName) !=
-        null
-
-      if (!doesBranchExist) {
-        await this._createBranch(
-          repository,
-          localBranchName,
-          `${remoteName}/${head.ref}`
-        )
-      }
-
-      await this._checkoutBranch(repository, localBranchName)
+      await this._checkoutBranch(repository, existingBranch)
     }
 
     this.statsStore.recordPRBranchCheckout()
@@ -5113,8 +5437,21 @@ export class AppStore extends TypedBaseStore<IAppState> {
     const resolvedExternalEditor = match != null ? match.editor : null
     if (this.resolvedExternalEditor !== resolvedExternalEditor) {
       this.resolvedExternalEditor = resolvedExternalEditor
+
+      // Make sure we let the tutorial assessor know that we have a new editor
+      // in case it's stuck waiting for one to be selected.
+      if (this.currentOnboardingTutorialStep === TutorialStep.PickEditor) {
+        if (this.selectedRepository instanceof Repository) {
+          this.updateCurrentTutorialStep(this.selectedRepository)
+        }
+      }
+
       this.emitUpdate()
     }
+  }
+
+  public getResolvedExternalEditor = () => {
+    return this.resolvedExternalEditor
   }
 
   /** This shouldn't be called directly. See `Dispatcher`. */
@@ -5169,74 +5506,44 @@ export class AppStore extends TypedBaseStore<IAppState> {
     this.emitUpdate()
   }
 
-  /** This shouldn't be called directly. See `Dispatcher`. */
-  public async _createStashAndDropPreviousEntry(
+  private async createStashAndDropPreviousEntry(
     repository: Repository,
-    branchName: string
+    branch: Branch
   ) {
-    if (!enableStashing()) {
-      return
-    }
+    const entry = await getLastDesktopStashEntryForBranch(repository, branch)
+    const gitStore = this.gitStoreCache.get(repository)
 
-    const previousStashEntry = await getLastDesktopStashEntryForBranch(
-      repository,
-      branchName
+    const createdStash = await gitStore.performFailableOperation(() =>
+      this.createStashEntry(repository, branch)
     )
 
-    if (previousStashEntry !== null) {
-      await dropDesktopStashEntry(repository, previousStashEntry.stashSha)
-      log.info(
-        `Dropped stash '${previousStashEntry.stashSha}' associated with ${
-          previousStashEntry.branchName
-        }`
-      )
+    if (createdStash === true && entry !== null) {
+      const { stashSha, branchName } = entry
+      await gitStore.performFailableOperation(async () => {
+        await dropDesktopStashEntry(repository, stashSha)
+        log.info(`Dropped stash '${stashSha}' associated with ${branchName}`)
+      })
     }
 
-    await createDesktopStashEntry(repository, branchName)
+    return createdStash === true
   }
 
-  /** This shouldn't be called directly. See `Dispatcher`. */
-  public async _moveChangesToBranchAndCheckout(
-    repository: Repository,
-    branchToCheckout: string
-  ) {
-    if (!enableStashing()) {
-      return
-    }
+  private async createStashEntry(repository: Repository, branch: Branch) {
+    const { changesState } = this.repositoryStateCache.get(repository)
+    const { workingDirectory } = changesState
+    const untrackedFiles = getUntrackedFiles(workingDirectory)
 
-    const gitStore = this.gitStoreCache.get(repository)
-    const isStashCreated = await gitStore.performFailableOperation(() => {
-      return createDesktopStashEntry(repository, branchToCheckout)
-    })
-
-    if (!isStashCreated) {
-      return
-    }
-
-    const transientStashEntry = await getLastDesktopStashEntryForBranch(
-      repository,
-      branchToCheckout
-    )
-    const strategy: UncommittedChangesStrategy = {
-      kind: UncommittedChangesStrategyKind.MoveToNewBranch,
-      transientStashEntry,
-    }
-    await this._checkoutBranch(repository, branchToCheckout, strategy)
+    return await createDesktopStashEntry(repository, branch, untrackedFiles)
   }
 
   /** This shouldn't be called directly. See `Dispatcher`. */
   public async _popStashEntry(repository: Repository, stashEntry: IStashEntry) {
-    if (!enableStashing()) {
-      return
-    }
     const gitStore = this.gitStoreCache.get(repository)
     await gitStore.performFailableOperation(() => {
       return popStashEntry(repository, stashEntry.stashSha)
     })
     log.info(
-      `[AppStore. _popStashEntry] popped stash with commit id ${
-        stashEntry.stashSha
-      }`
+      `[AppStore. _popStashEntry] popped stash with commit id ${stashEntry.stashSha}`
     )
 
     this.statsStore.recordStashRestore()
@@ -5248,17 +5555,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
     repository: Repository,
     stashEntry: IStashEntry
   ) {
-    if (!enableStashing()) {
-      return
-    }
     const gitStore = this.gitStoreCache.get(repository)
     await gitStore.performFailableOperation(() => {
       return dropDesktopStashEntry(repository, stashEntry.stashSha)
     })
     log.info(
-      `[AppStore. _dropStashEntry] dropped stash with commit id ${
-        stashEntry.stashSha
-      }`
+      `[AppStore. _dropStashEntry] dropped stash with commit id ${stashEntry.stashSha}`
     )
 
     this.statsStore.recordStashDiscard()
@@ -5289,6 +5591,100 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
     await this.currentBranchPruner.testPrune()
   }
+
+  public async _showCreateForkDialog(
+    repository: RepositoryWithGitHubRepository
+  ) {
+    const account = getAccountForRepository(this.accounts, repository)
+    if (account === null) {
+      return
+    }
+    await this._showPopup({
+      type: PopupType.CreateFork,
+      repository,
+      account,
+    })
+  }
+
+  /**
+   * Converts a local repository to use the given fork
+   * as its default remote and associated `GitHubRepository`.
+   */
+  public async _convertRepositoryToFork(
+    repository: RepositoryWithGitHubRepository,
+    fork: IAPIFullRepository
+  ): Promise<Repository> {
+    const gitStore = this.gitStoreCache.get(repository)
+    const defaultRemoteName = gitStore.defaultRemote?.name
+    const remoteUrl = gitStore.defaultRemote?.url
+    const { endpoint } = repository.gitHubRepository
+
+    // make sure there is a default remote (there should be)
+    if (defaultRemoteName !== undefined && remoteUrl !== undefined) {
+      // update default remote
+      if (await gitStore.setRemoteURL(defaultRemoteName, fork.clone_url)) {
+        await gitStore.ensureUpstreamRemoteURL(remoteUrl)
+        // update associated github repo
+        return this.repositoriesStore.setGitHubRepository(
+          repository,
+          await this.repositoriesStore.upsertGitHubRepository(endpoint, fork)
+        )
+      }
+    }
+    return repository
+  }
+
+  /**
+   * Create a tutorial repository using the given account. The account
+   * determines which host (i.e. GitHub.com or a GHES instance) that
+   * the tutorial repository should be created on.
+   *
+   * @param account The account (and thereby the GitHub host) under
+   *                which the repository is to be created created
+   */
+  public async _createTutorialRepository(account: Account) {
+    try {
+      await this.statsStore.recordTutorialStarted()
+
+      const name = 'desktop-tutorial'
+      const path = Path.resolve(getDefaultDir(), name)
+
+      const apiRepository = await createTutorialRepository(
+        account,
+        name,
+        path,
+        (title, value, description) => {
+          if (
+            this.currentPopup !== null &&
+            this.currentPopup.type === PopupType.CreateTutorialRepository
+          ) {
+            this.currentPopup = {
+              ...this.currentPopup,
+              progress: { kind: 'generic', title, value, description },
+            }
+            this.emitUpdate()
+          }
+        }
+      )
+
+      await this._addTutorialRepository(path, account.endpoint, apiRepository)
+      await this.statsStore.recordTutorialRepoCreated()
+    } catch (err) {
+      sendNonFatalException('tutorialRepoCreation', err)
+
+      if (err instanceof GitError) {
+        this.emitError(err)
+      } else {
+        this.emitError(
+          new Error(
+            `Failed creating the tutorial repository.\n\n${err.message}`
+          )
+        )
+      }
+    } finally {
+      this._closePopup(PopupType.CreateTutorialRepository)
+    }
+  }
 }
 
 /**
@@ -5312,17 +5708,6 @@ function getInitialAction(
     comparisonMode,
     branch: comparisonBranch,
   }
-}
-
-/**
- * Get the behind count (or 0) of the ahead/behind counter
- */
-function getBehindOrDefault(aheadBehind: IAheadBehind | null): number {
-  if (aheadBehind === null) {
-    return 0
-  }
-
-  return aheadBehind.behind
 }
 
 /**
@@ -5357,31 +5742,13 @@ function userIsStartingRebaseFlow(
   return false
 }
 
-function findAssociatedPullRequest(
-  branch: Branch,
-  pullRequests: ReadonlyArray<PullRequest>,
-  remote: IRemote
-): PullRequest | null {
-  const upstream = branch.upstreamWithoutRemote
-
-  if (upstream == null) {
-    return null
+function isLocalChangesOverwrittenError(error: Error): boolean {
+  if (error instanceof ErrorWithMetadata) {
+    return isLocalChangesOverwrittenError(error.underlyingError)
   }
 
   return (
-    pullRequests.find(pr =>
-      isPullRequestAssociatedWithBranch(remote, branch, pr)
-    ) || null
-  )
-}
-
-function isPullRequestAssociatedWithBranch(
-  remote: IRemote,
-  branch: Branch,
-  pr: PullRequest
-) {
-  return (
-    pr.head.ref === branch.upstreamWithoutRemote &&
-    repositoryMatchesRemote(pr.head.gitHubRepository, remote)
+    error instanceof GitError &&
+    error.result.gitError === DugiteError.LocalChangesOverwritten
   )
 }

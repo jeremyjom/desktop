@@ -20,25 +20,17 @@ import {
   ChangesSelectionKind,
 } from '../app-state'
 import { ComparisonCache } from '../comparison-cache'
-import { IGitHubUser } from '../databases'
 import { merge } from '../merge'
 import { DefaultCommitMessage } from '../../models/commit-message'
 
 export class RepositoryStateCache {
   private readonly repositoryState = new Map<string, IRepositoryState>()
 
-  public constructor(
-    private readonly getUsersForRepository: (
-      repository: Repository
-    ) => Map<string, IGitHubUser>
-  ) {}
-
   /** Get the state for the repository. */
   public get(repository: Repository): IRepositoryState {
     const existing = this.repositoryState.get(repository.hash)
     if (existing != null) {
-      const gitHubUsers = this.getUsersForRepository(repository)
-      return merge(existing, { gitHubUsers })
+      return existing
     }
 
     const newItem = getInitialRepositoryState()
@@ -148,7 +140,6 @@ function getInitialRepositoryState(): IRepositoryState {
       rebasedBranches: new Map<string, string>(),
     },
     compareState: {
-      isDivergingBranchBannerVisible: false,
       formState: {
         kind: HistoryTabMode.History,
       },
@@ -161,7 +152,6 @@ function getInitialRepositoryState(): IRepositoryState {
       allBranches: new Array<Branch>(),
       recentBranches: new Array<Branch>(),
       defaultBranch: null,
-      inferredComparisonBranch: { branch: null, aheadBehind: null },
     },
     rebaseState: {
       step: null,
@@ -170,9 +160,10 @@ function getInitialRepositoryState(): IRepositoryState {
       userHasResolvedConflicts: false,
     },
     commitAuthor: null,
-    gitHubUsers: new Map<string, IGitHubUser>(),
     commitLookup: new Map<string, Commit>(),
     localCommitSHAs: [],
+    localTags: null,
+    tagsToPush: null,
     aheadBehind: null,
     remote: null,
     isPushPullFetchInProgress: false,
